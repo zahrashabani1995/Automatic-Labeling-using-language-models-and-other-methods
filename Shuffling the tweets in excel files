@@ -1,0 +1,41 @@
+import pandas as pd
+from google.colab import files
+import io
+import time
+
+# زمان‌سنجی برای پردازش
+start_time = time.time()
+
+# آپلود فایل اکسل
+print("لطفاً فایل اکسل توییت‌ها (مثلاً 'tweets.xlsx') را آپلود کنید:")
+uploaded = files.upload()
+
+if not uploaded:
+    raise ValueError("فایل آپلود نشد. لطفاً فایل اکسل را آپلود کنید.")
+
+# خواندن فایل اکسل
+input_file = list(uploaded.keys())[0]
+df = pd.read_excel(io.BytesIO(uploaded[input_file]))
+
+# اطمینان از وجود ستون "متن توییت"
+if 'متن توییت' not in df.columns:
+    raise ValueError("ستون 'متن توییت' در فایل یافت نشد.")
+
+# به‌هم‌ریختن تصادفی ترتیب ردیف‌ها
+df_shuffled = df.sample(frac=1, random_state=None).reset_index(drop=True)
+
+# ذخیره فایل اکسل خروجی
+output_excel = "shuffled_tweets.xlsx"
+df_shuffled.to_excel(output_excel, index=False)
+
+# ذخیره فایل متنی با جداکننده |
+output_text = "shuffled_tweets.txt"
+df_shuffled.to_csv(output_text, sep='|', index=False, encoding='utf-8')
+
+print(f"فایل اکسل ذخیره شد: {output_excel}")
+print(f"فایل متنی ذخیره شد: {output_text}")
+print(f"زمان کل پردازش: {time.time() - start_time:.2f} ثانیه")
+
+# دانلود خودکار فایل‌های خروجی
+files.download(output_excel)
+files.download(output_text)
