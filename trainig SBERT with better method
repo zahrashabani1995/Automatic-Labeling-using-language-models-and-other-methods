@@ -1,0 +1,213 @@
+import pandas as pd
+import re
+from google.colab import files
+import io
+from sentence_transformers import SentenceTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix, roc_auc_score
+from sklearn.preprocessing import label_binarize
+from imblearn.over_sampling import SMOTE
+import time
+import numpy as np
+
+# زمان‌سنجی برای پردازش
+start_time = time.time()
+
+# تعریف واژگان دسته اول و دوم
+category_1 = [
+    "خودکشی", "آماده خودکشی", "نقشه خودکشی", "مرگ خودخواسته", "می‌خواهم خودم را بکشم",
+    "تا ابد بخوابم", "هیچوقت بیدار نشم", "به زندگی‌ام پایان می‌دهم", "نمی‌تونم ادامه بدم",
+    "نمی‌خوام زنده باشم", "خودسوزی", "زندگی برای من تمام شده", "خودم را خلاص کنم",
+    "خودمو خلاص کنم", "خودم رو خلاص کنم", "چرا نباید خودم را بکشم؟", "#خودکشی"
+]
+
+category_2 = [
+    "افسردگی", "دارم عذاب می‌کشم", "هیچ امیدی ندارم", "از خودم متنفرم", "از خودم بدم میاد",
+    "چیزی برای از دست دادن ندارم", "از زندگی خسته‌ام", "تنها می‌میرم", "مرگ", "درد", "ناامیدی",
+    "تنهایی", "غم", "بی‌ارزش", "خستگی", "فشار رومه", "استرس", "استرس دارم", "همه چیز بی‌فایده است",
+    "هیچکس مرا نمی‌فهمد", "از همه چیز متنفرم", "#افسردگی", "#تنهایی", "#درد", "#غم", "#ناامیدی"
+]
+
+# کلمات زمینه برای تفکیک خودزنی واقعی و استعاری
+serious_context = [
+    "قرص", "خون", "آسیب", "گریه", "جیغ", "درد", "افسردگی", "خودکشی", "مرگ", "ناامیدی"
+]
+humorous_context = [
+    "😂", "😁", "🤣", "سوتی", "کصخل", "خنده", "شوخی", "فان", "ههه", "هاها"
+]
+
+# تابع برای بازسازی ستون‌های اضافی
+def reconstruct_metadata(tweet, label):
+    tweet = str(tweet).lower()
+    
+    if "خودزنی" in tweet:
+        if any(re.search(r'\b' + re.escape(word) + r'\b', tweet) for word in serious_context):
+            return "دسته اول", "خودزنی", 0.9
+        elif any(re.search(r'\b' + re.escape(word) + r'\b', tweet) for word in humorous_context) or "😂" in tweet or "😁" in tweet:
+            return "هیچ‌کدام", "خودزنی", 0.3
+        else:
+            return "هیچ‌کدام", "خودزنی", 0.3
+    
+    for word in category_1:
+        if re.search(r'\b' + re.escape(word) + r'\b', tweet):
+            return "دسته اول", word, 0.9
+    
+    for word in category_2:
+        if re.search(r'\b' + re.escape(word) + r'\b', tweet):
+            return "دسته دوم", word, 0.65
+    
+    return "هیچ‌کدام", "هیچ‌کدام", 0.3
+
+# تابع برای محاسبه Specificity
+def specificity_score(y_true, y_pred, classes):
+    cm = confusion_matrix(y_true, y_pred, labels=classes)
+    specificity_per_class = []
+    for i in range(len(classes)):
+        tn = np.sum(cm) - np.sum(cm[i, :]) - np.sum(cm[:, i]) + cm[i, i]
+        fp = np.sum(cm[:, i]) - cm[i, i]
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        specificity_per_class.append(specificity)
+    return np.mean(specificity_per_class)
+
+# نصب کتابخانه‌ها
+!pip install sentence-transformers imbalanced-learn
+
+# آپلود فایل آموزشی
+print("لطفاً فایل آموزشی 'labeled_tweets_3000.xlsx' را آپلود کنید:")
+uploaded_train = files.upload()
+
+if not uploaded_train:
+    raise ValueError("فایل آموزشی آپلود نشد. لطفاً فایل 'labeled_tweets_3000.xlsx' را آپلود کنید.")
+
+# خواندن فایل آموزشی
+train_file = list(uploaded_train.keys())[0]
+df_train = pd.read_excel(io.BytesIO(uploaded_train[train_file]))
+
+# اطمینان از وجود ستون‌های مورد نیاز
+required_columns = ['متن توییت', 'برچسب']
+if not all(col in df_train.columns for col in required_columns):
+    raise ValueError("ستون‌های 'متن توییت' یا 'برچسب' در فایل آموزشی یافت نشد.")
+
+# آماده‌سازی داده‌های آموزشی
+X_train_texts = df_train['متن توییت'].astype(str)
+y_train = df_train['برچسب'].astype(int)
+
+# بارگذاری مدل SBERT قوی‌تر
+model_sbert = SentenceTransformer('xlm-r-bert-base-nli-stsb-mean-tokens')
+
+# تبدیل متن‌های آموزشی به امبدینگ
+print("در حال تولید امبدینگ‌های آموزشی...")
+X_train_embeddings = model_sbert.encode(X_train_texts.tolist(), show_progress_bar=True, batch_size=32)
+
+# اعمال SMOTE برای رفع نامتوازنی
+smote = SMOTE(random_state=42)
+X_train_balanced, y_train_balanced = smote.fit_resample(X_train_embeddings, y_train)
+
+# تقسیم داده‌ها به آموزشی و آزمایشی
+X_train_split, X_test_split, y_train_split, y_test_split = train_test_split(
+    X_train_balanced, y_train_balanced, test_size=0.2, random_state=42
+)
+
+# آموزش مدل طبقه‌بند RandomForest
+classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+classifier.fit(X_train_split, y_train_split)
+
+# محاسبه معیارهای ارزیابی با Cross-Validation
+cv_scores = cross_val_score(classifier, X_train_balanced, y_train_balanced, cv=5, scoring='accuracy')
+print(f"میانگین دقت Cross-Validation (5-fold): {cv_scores.mean():.2%} (±{cv_scores.std():.2%})")
+
+# محاسبه معیارهای ارزیابی روی داده‌های آزمایشی
+y_pred_test = classifier.predict(X_test_split)
+accuracy = accuracy_score(y_test_split, y_pred_test)
+precision_weighted = precision_score(y_test_split, y_pred_test, average='weighted', zero_division=0)
+recall_weighted = recall_score(y_test_split, y_pred_test, average='weighted', zero_division=0)
+f1_weighted = f1_score(y_test_split, y_pred_test, average='weighted', zero_division=0)
+precision_macro = precision_score(y_test_split, y_pred_test, average='macro', zero_division=0)
+recall_macro = recall_score(y_test_split, y_pred_test, average='macro', zero_division=0)
+f1_macro = f1_score(y_test_split, y_pred_test, average='macro', zero_division=0)
+specificity_macro = specificity_score(y_test_split, y_pred_test, classes=[0, 1, 2])
+
+# محاسبه AUC
+y_test_bin = label_binarize(y_test_split, classes=[0, 1, 2])
+y_pred_prob = classifier.predict_proba(X_test_split)
+auc = roc_auc_score(y_test_bin, y_pred_prob, multi_class='ovr', average='weighted')
+
+# محاسبه Confusion Matrix
+cm = confusion_matrix(y_test_split, y_pred_test, labels=[0, 1, 2])
+
+# چاپ معیارهای ارزیابی
+print("معیارهای ارزیابی مدل روی داده‌های آزمایشی:")
+print(f"1. دقت (Accuracy): {accuracy:.2%}")
+print(f"2. دقت مثبت (Precision, weighted): {precision_weighted:.2%}")
+print(f"3. یادآوری (Recall, weighted): {recall_weighted:.2%}")
+print(f"4. امتیاز F1 (F1-Score, weighted): {f1_weighted:.2%}")
+print(f"5. دقت مثبت (Precision, macro): {precision_macro:.2%}")
+print(f"6. یادآوری (Recall, macro): {recall_macro:.2%}")
+print(f"7. امتیاز F1 (F1-Score, macro): {f1_macro:.2%}")
+print(f"8. ویژگی (Specificity, macro): {specificity_macro:.2%}")
+print(f"AUC (weighted): {auc:.2%}")
+print("\nماتریس درهم‌ریختگی (Confusion Matrix):")
+print(cm)
+print("\nگزارش کامل طبقه‌بندی:")
+print(classification_report(y_test_split, y_pred_test, zero_division=0))
+
+# آپلود فایل جدید
+print("لطفاً فایل جدید 'new_tweets.xlsx' را آپلود کنید:")
+uploaded_new = files.upload()
+
+if not uploaded_new:
+    raise ValueError("فایل جدید آپلود نشد. لطفاً فایل 'new_tweets.xlsx' را آپلود کنید.")
+
+# خواندن فایل جدید
+new_file = list(uploaded_new.keys())[0]
+df_new = pd.read_excel(io.BytesIO(uploaded_new[new_file]))
+
+# اطمینان از وجود ستون "متن توییت"
+if 'متن توییت' not in df_new.columns:
+    raise ValueError("ستون 'متن توییت' در فایل جدید یافت نشد.")
+
+# تبدیل متن‌های جدید به امبدینگ
+print("در حال تولید امبدینگ‌های داده‌های جدید...")
+X_new_texts = df_new['متن توییت'].astype(str)
+X_new_embeddings = model_sbert.encode(X_new_texts.tolist(), show_progress_bar=True, batch_size=32)
+
+# پیش‌بینی لیبل‌ها
+y_pred_new = classifier.predict(X_new_embeddings)
+
+# اصلاح برچسب‌ها برای خودزنی استعاری
+for i, (tweet, label) in enumerate(zip(X_new_texts, y_pred_new)):
+    tweet_lower = tweet.lower()
+    if "خودزنی" in tweet_lower:
+        if any(word in tweet_lower for word in humorous_context) or "😂" in tweet_lower or "😁" in tweet_lower:
+            y_pred_new[i] = 0  # خودزنی استعاری: برچسب 0
+
+# ایجاد دیتافریم خروجی
+df_output = df_new.copy()[['متن توییت']]
+df_output['برچسب'] = y_pred_new
+df_output['مجموعه واژگان'] = ''
+df_output['واژه/عبارت مشابه'] = ''
+df_output['آستانه شباهت'] = 0.0
+
+# بازسازی ستون‌های اضافی
+for index, row in df_output.iterrows():
+    category, matched_word, similarity = reconstruct_metadata(row['متن توییت'], row['برچسب'])
+    df_output.at[index, 'مجموعه واژگان'] = category
+    df_output.at[index, 'واژه/عبارت مشابه'] = matched_word
+    df_output.at[index, 'آستانه شباهت'] = similarity
+
+# ذخیره فایل اکسل خروجی
+output_excel = "new_labeled_tweets.xlsx"
+df_output.to_excel(output_excel, index=False)
+
+# ذخیره فایل متنی با جداکننده |
+output_text = "new_labeled_tweets.txt"
+df_output.to_csv(output_text, sep='|', index=False, encoding='utf-8')
+
+print(f"فایل اکسل ذخیره شد: {output_excel}")
+print(f"فایل متنی ذخیره شد: {output_text}")
+print(f"زمان کل پردازش: {time.time() - start_time:.2f} ثانیه")
+
+# دانلود خودکار فایل‌های خروجی
+files.download(output_excel)
+files.download(output_text)
