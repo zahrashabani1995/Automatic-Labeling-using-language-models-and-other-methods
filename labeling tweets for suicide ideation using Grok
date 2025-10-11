@@ -1,0 +1,103 @@
+import pandas as pd
+import re
+from google.colab import files
+import io
+import time
+
+# زمان‌سنجی برای پردازش
+start_time = time.time()
+
+# تعریف واژگان دسته اول و دوم
+category_1 = [
+    "خودکشی", "آماده خودکشی", "نقشه خودکشی", "مرگ خودخواسته", "می‌خواهم خودم را بکشم",
+    "تا ابد بخوابم", "هیچوقت بیدار نشم", "به زندگی‌ام پایان می‌دهم", "نمی‌تونم ادامه بدم",
+    "نمی‌خوام زنده باشم", "خودسوزی", "زندگی برای من تمام شده", "خودم را خلاص کنم",
+    "خودمو خلاص کنم", "خودم رو خلاص کنم", "چرا نباید خودم را بکشم؟", "#خودکشی"
+]
+
+category_2 = [
+    "افسردگی", "دارم عذاب می‌کشم", "هیچ امیدی ندارم", "از خودم متنفرم", "از خودم بدم میاد",
+    "چیزی برای از دست دادن ندارم", "از زندگی خسته‌ام", "تنها می‌میرم", "مرگ", "درد", "ناامیدی",
+    "تنهایی", "غم", "بی‌ارزش", "خستگی", "فشار رومه", "استرس", "استرس دارم", "همه چیز بی‌فایده است",
+    "هیچکس مرا نمی‌فهمد", "از همه چیز متنفرم", "#افسردگی", "#تنهایی", "#درد", "#غم", "#ناامیدی"
+]
+
+# کلمات زمینه برای تفکیک خودزنی واقعی و استعاری
+serious_context = [
+    "قرص", "خون", "آسیب", "گریه", "جیغ", "درد", "افسردگی", "خودکشی", "مرگ", "ناامیدی"
+]
+humorous_context = [
+    "😂", "😁", "🤣", "سوتی", "کصخل", "خنده", "شوخی", "فان", "ههه", "هاها"
+]
+
+# تابع برای لیبل‌گذاری توییت‌ها با تفکیک خودزنی واقعی و استعاری
+def label_tweet(tweet):
+    tweet = str(tweet).lower()
+    
+    # بررسی خودزنی واقعی یا استعاری
+    if "خودزنی" in tweet:
+        if any(re.search(r'\b' + re.escape(word) + r'\b', tweet) for word in serious_context):
+            return 2, "دسته اول", "خودزنی", 0.9
+        elif any(re.search(r'\b' + re.escape(word) + r'\b', tweet) for word in humorous_context) or "😂" in tweet or "😁" in tweet:
+            return 0, "هیچ‌کدام", "خودزنی", 0.3
+        else:
+            return 0, "هیچ‌کدام", "خودزنی", 0.3
+    
+    # بررسی واژگان دسته اول
+    for word in category_1:
+        if re.search(r'\b' + re.escape(word) + r'\b', tweet):
+            return 2, "دسته اول", word, 0.9
+    
+    # بررسی واژگان دسته دوم
+    for word in category_2:
+        if re.search(r'\b' + re.escape(word) + r'\b', tweet):
+            return 1, "دسته دوم", word, 0.65
+    
+    # اگر هیچ واژه کلیدی پیدا نشد
+    return 0, "هیچ‌کدام", "هیچ‌کدام", 0.3
+
+# آپلود فایل جدید با ~3,000 توییت
+print("لطفاً فایل جدید 'new_tweets.xlsx' را آپلود کنید:")
+uploaded_new = files.upload()
+
+if not uploaded_new:
+    raise ValueError("فایل جدید آپلود نشد. لطفاً فایل 'new_tweets.xlsx' را آپلود کنید.")
+
+# خواندن فایل جدید
+new_file = list(uploaded_new.keys())[0]
+df_new = pd.read_excel(io.BytesIO(uploaded_new[new_file]))
+
+# اطمینان از وجود ستون "متن توییت"
+if 'متن توییت' not in df_new.columns:
+    raise ValueError("ستون 'متن توییت' در فایل جدید یافت نشد.")
+
+# ایجاد ستون‌های جدید برای لیبل‌گذاری
+df_output = df_new.copy()[['متن توییت']]
+df_output['برچسب'] = ''
+df_output['مجموعه واژگان'] = ''
+df_output['واژه/عبارت مشابه'] = ''
+df_output['آستانه شباهت'] = 0.0
+
+# لیبل‌گذاری تمام توییت‌ها
+for index, row in df_output.iterrows():
+    label, category, matched_word, similarity = label_tweet(row['متن توییت'])
+    df_output.at[index, 'برچسب'] = label
+    df_output.at[index, 'مجموعه واژگان'] = category
+    df_output.at[index, 'واژه/عبارت مشابه'] = matched_word
+    df_output.at[index, 'آستانه شباهت'] = similarity
+
+# ذخیره فایل اکسل خروجی
+output_excel = "new_labeled_tweets.xlsx"
+df_output.to_excel(output_excel, index=False)
+
+# ذخیره فایل متنی با جداکننده |
+output_text = "new_labeled_tweets.txt"
+df_output.to_csv(output_text, sep='|', index=False, encoding='utf-8')
+
+print(f"فایل اکسل ذخیره شد: {output_excel}")
+print(f"فایل متنی ذخیره شد: {output_text}")
+print(f"زمان کل پردازش: {time.time() - start_time:.2f} ثانیه")
+
+# دانلود خودکار فایل‌های خروجی
+files.download(output_excel)
+files.download(output_text)
