@@ -1,0 +1,273 @@
+# نصب کتابخانه‌های مورد نیاز (TensorFlow, Keras, Parsivar)
+!pip install tensorflow parsivar scikit-learn numpy pandas openpyxl
+
+import pandas as pd
+import numpy as np
+import re
+import io
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+
+from google.colab import files
+from parsivar import Normalizer, Tokenizer # استفاده از Parsivar
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, 
+    cohen_kappa_score, mean_absolute_error, recall_score, roc_auc_score, roc_curve
+)
+
+# کتابخانه‌های یادگیری عمیق
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+# **لایه LSTM جایگزین Conv1D می‌شود**
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout 
+from tensorflow.keras.preprocessing.text import Tokenizer as KerasTokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+# --- الف: بارگذاری فایل (فرض بر این است که فایل اکسل لیبل‌گذاری شده آپلود شده است) ---
+print("لطفا فایل اکسل لیبل‌گذاری شده را آپلود کنید (اگر قبلاً آپلود نشده است):")
+uploaded = files.upload()
+file_name = next(iter(uploaded))
+
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+df.columns = ['text', 'label'] 
+
+# --- ب: پیش‌پردازش (همان تابع قبلی) ---
+normalizer = Normalizer()
+tokenizer = Tokenizer()
+stop_words = set([
+    "از", "به", "با", "در", "بر", "برای", "که", "و", "یا", "یک", "این", "آن",
+    "ها", "ای", "را", "هم", "بود", "است", "باشد", "شد", "می", "همین", "چنین",
+    "اما", "اگر", "چون", "تا", "ما", "من", "تو", "او", "شما", "ایشان"
+])
+
+def preprocess_text(text):
+    if pd.isna(text) or not text:
+        return ""
+    text = normalizer.normalize(str(text))
+    text = re.sub(r'http\S+|www\S+|#\w+|@\w+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[^\u0600-\u06FF\s]', '', text) 
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    tokens = tokenizer.tokenize_words(text)
+    filtered_tokens = [token for token in tokens if token not in stop_words and len(token) > 1]
+    
+    return ' '.join(filtered_tokens)
+
+df['cleaned_text'] = df['text'].apply(preprocess_text)
+print("✅ پیش‌پردازش متن با Parsivar انجام شد.")
+
+# --- ج: توکن‌سازی و Padding برای LSTM ---
+MAX_WORDS = 5000     # حداکثر تعداد کلمات در واژه‌نامه
+MAX_SEQ_LENGTH = 100 # حداکثر طول هر توئیت (برای Padding)
+EMBEDDING_DIM = 100  # ابعاد فضای تعبیه‌سازی
+
+keras_tokenizer = KerasTokenizer(num_words=MAX_WORDS, oov_token="<unk>")
+keras_tokenizer.fit_on_texts(df['cleaned_text'])
+
+sequences = keras_tokenizer.texts_to_sequences(df['cleaned_text'])
+
+# یکسان‌سازی طول دنباله‌ها
+X = pad_sequences(sequences, maxlen=MAX_SEQ_LENGTH)
+y = df['label'].values
+
+num_classes = len(np.unique(y))
+y_one_hot = to_categorical(y, num_classes=num_classes)
+
+print(f"✅ ابعاد داده‌های ورودی (X): {X.shape}")
+print(f"✅ ابعاد لیبل‌های خروجی (y_one_hot): {y_one_hot.shape}")
+# --- الف: تقسیم داده‌ها (۶۰:۳۰:۱۰) ---
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y_one_hot, test_size=0.4, random_state=42, stratify=y
+)
+validation_ratio_from_temp = 0.25 
+X_test, X_val, y_test, y_val = train_test_split(
+    X_temp, y_temp, 
+    test_size=validation_ratio_from_temp, 
+    random_state=42, 
+    # stratify بر اساس لیبل‌های عددی
+    stratify=np.argmax(y_temp, axis=1) 
+)
+
+print(f"✅ تقسیم داده‌ها: Train: {len(X_train)}, Test: {len(X_test)}, Validation: {len(X_val)}")
+
+# --- ب: ساخت مدل LSTM ---
+model = Sequential()
+
+# ۱. لایه تعبیه‌سازی
+model.add(Embedding(input_dim=MAX_WORDS, 
+                    output_dim=EMBEDDING_DIM, 
+                    input_length=MAX_SEQ_LENGTH, 
+                    name='embedding_layer'))
+
+# ۲. لایه LSTM (با تکنیک‌های ضد Overfitting)
+model.add(LSTM(
+    units=128, 
+    dropout=0.4,          # Dropout بر روی اتصالات ورودی
+    recurrent_dropout=0.4, # Dropout بر روی اتصالات بازگشتی (بسیار مؤثر برای LSTM)
+    return_sequences=False # خروجی آخرین گام زمانی برای دسته‌بندی
+))
+
+# ۳. لایه‌های Dense (فشرده) برای دسته‌بندی
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.5)) # Dropout بیشتر
+
+# ۴. لایه خروجی
+model.add(Dense(num_classes, activation='softmax'))
+
+# کامپایل مدل
+model.compile(optimizer='adam',
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+model.summary()
+print("\n🚀 آموزش مدل LSTM آغاز شد...")
+
+# --- ج: آموزش مدل با Early Stopping ---
+# Early Stopping برای جلوگیری خودکار از Overfitting
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', 
+    patience=4,         # افزایش صبر برای مدلهای متوالی
+    restore_best_weights=True
+)
+
+history = model.fit(
+    X_train, y_train,
+    epochs=50, # تعداد دورهای تکرار زیاد انتخاب می‌شود تا Early Stopping کار کند
+    batch_size=32,
+    validation_data=(X_val, y_val), 
+    callbacks=[early_stopping],
+    verbose=1
+)
+
+print("✅ آموزش مدل LSTM با موفقیت به پایان رسید.")
+
+# --- د: پیش‌بینی روی داده‌های تست ---
+y_prob_lstm = model.predict(X_test)
+y_pred_lstm = np.argmax(y_prob_lstm, axis=1) 
+y_test_labels = np.argmax(y_test, axis=1)
+from sklearn.preprocessing import LabelBinarizer
+
+# --- تعریف نام دسته‌ها ---
+LABELS = [0, 1, 2]
+CLASS_NAMES = {
+    0: 'Non-related', 
+    1: 'Indirect Suicide Signs', 
+    2: 'Direct Suicide Signs'
+}
+
+# --- الف: محاسبه معیارها و ذخیره در اکسل ---
+
+# ۱. معیارهای اصلی
+accuracy = accuracy_score(y_test_labels, y_pred_lstm)
+kappa = cohen_kappa_score(y_test_labels, y_pred_lstm)
+mcc = matthews_corrcoef(y_test_labels, y_pred_lstm)
+f1_macro = f1_score(y_test_labels, y_pred_lstm, average='macro')
+f1_weighted = f1_score(y_test_labels, y_pred_lstm, average='weighted')
+mae = mean_absolute_error(y_test_labels, y_pred_lstm)
+rmse = math.sqrt(np.mean((y_test_labels - y_pred_lstm)**2)) 
+recall_macro = recall_score(y_test_labels, y_pred_lstm, average='macro')
+
+# ۲. AUC-ROC (OVR)
+try:
+    auc_roc_ovr = roc_auc_score(y_test, y_prob_lstm, multi_class='ovr')
+except ValueError:
+    auc_roc_ovr = "N/A"
+
+# ۳. Specificity (برای هر کلاس)
+tn_rate = {}
+for i in LABELS:
+    tn, fp, fn, tp = confusion_matrix(y_test_labels == i, y_pred_lstm == i).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 
+    tn_rate[i] = specificity
+
+# ۴. جمع‌آوری و ذخیره در اکسل
+results = {
+    'Metric': [
+        'Accuracy', "Cohen's Kappa", 'MCC', 'F1-score (Macro)', 
+        'F1-score (Weighted)', 'MAE', 'RMSE', 'Macro Average Recall (Sensitivity)', 
+        'AUC-ROC (OVR)'
+    ],
+    'Value': [
+        accuracy, kappa, mcc, f1_macro, f1_weighted, mae, rmse, 
+        recall_macro, auc_roc_ovr
+    ]
+}
+results_df = pd.DataFrame(results)
+
+for label, name in CLASS_NAMES.items():
+    results_df = pd.concat([results_df, pd.DataFrame({
+        'Metric': [f'Specificity ({name})'],
+        'Value': [tn_rate[label]]
+    })], ignore_index=True)
+
+output_results_file = 'LSTM_Evaluation_Metrics.xlsx'
+results_df.to_excel(output_results_file, index=False)
+files.download(output_results_file)
+print("✅ معیارهای ارزیابی با موفقیت محاسبه و در فایل اکسل ذخیره شدند.")
+print("\n--- خلاصه‌ای از معیارهای اصلی ---")
+print(results_df.head(10).to_string(index=False))
+
+# --- ب: ترسیم نمودارها ---
+
+# ۱. Confusion Matrix
+cm = confusion_matrix(y_test_labels, y_pred_lstm, labels=LABELS)
+cm_df = pd.DataFrame(cm, index=CLASS_NAMES.values(), columns=CLASS_NAMES.values())
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues', linewidths=.5, linecolor='black')
+plt.title('Confusion Matrix', fontsize=16)
+plt.ylabel('True Label (Actual)', fontsize=14)
+plt.xlabel('Predicted Label', fontsize=14)
+plt.show()
+
+
+# ۲. AUC-ROC Curve per Class
+plt.figure(figsize=(10, 7))
+lb = LabelBinarizer()
+y_test_binarized = lb.fit_transform(y_test_labels) 
+
+for i in range(len(LABELS)):
+    fpr, tpr, _ = roc_curve(y_test_binarized[:, i], y_prob_lstm[:, i])
+    auc_score = roc_auc_score(y_test_binarized[:, i], y_prob_lstm[:, i])
+    
+    plt.plot(fpr, tpr, 
+             label=f"Class {LABELS[i]} ({CLASS_NAMES[LABELS[i]]}) AUC = {auc_score:.2f}")
+
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
+plt.ylabel('True Positive Rate (Recall/Sensitivity)', fontsize=12)
+plt.title('AUC-ROC Curve per Class (One-vs-Rest Strategy)', fontsize=16)
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+
+
+# --- ج: نمودار Loss و Accuracy آموزش ---
+plt.figure(figsize=(12, 5))
+
+# Loss
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+# Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.show()
+
+
+print("\n✅ تمامی نمودارهای درخواستی تولید و نمایش داده شدند.")
+print("✅ کتابخانه‌ها با موفقیت نصب و وارد شدند.")
