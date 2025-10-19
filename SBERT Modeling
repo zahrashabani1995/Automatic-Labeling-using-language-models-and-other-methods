@@ -1,0 +1,200 @@
+# نصب کتابخانه‌های مورد نیاز
+!pip install sentence-transformers parsivar scikit-learn numpy pandas openpyxl
+
+import pandas as pd
+import numpy as np
+import re
+import io
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+
+from google.colab import files
+from parsivar import Normalizer, Tokenizer 
+from sentence_transformers import SentenceTransformer
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC 
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, 
+    cohen_kappa_score, mean_absolute_error, recall_score, roc_auc_score, roc_curve
+)
+from sklearn.preprocessing import LabelBinarizer
+
+# --- بارگذاری فایل و پیش‌پردازش ---
+
+print("لطفا فایل اکسل لیبل‌گذاری شده را آپلود کنید:")
+uploaded = files.upload()
+file_name = next(iter(uploaded))
+
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+df.columns = ['text', 'label'] 
+print(f"✅ فایل با {len(df)} سطر با موفقیت خوانده شد.")
+
+# --- پیش‌پردازش (آماده‌سازی Parsivar) ---
+normalizer = Normalizer()
+tokenizer = Tokenizer()
+stop_words = set([
+    "از", "به", "با", "در", "بر", "برای", "که", "و", "یا", "یک", "این", "آن",
+    "ها", "ای", "را", "هم", "بود", "است", "باشد", "شد", "می", "همین", "چنین",
+    "اما", "اگر", "چون", "تا", "ما", "من", "تو", "او", "شما", "ایشان"
+])
+
+def preprocess_text(text):
+    """تابع جامع پیش‌پردازش متن فارسی با Parsivar"""
+    if pd.isna(text) or not text:
+        return ""
+    
+    text = normalizer.normalize(str(text))
+    text = re.sub(r'http\S+|www\S+|#\w+|@\w+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[^\u0600-\u06FF\s]', '', text) 
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    tokens = tokenizer.tokenize_words(text)
+    filtered_tokens = [token for token in tokens if token not in stop_words and len(token) > 1]
+    
+    return ' '.join(filtered_tokens)
+
+# اعمال پیش‌پردازش
+df['cleaned_text'] = df['text'].apply(preprocess_text)
+# --- الف: استخراج بردارها با SBERT ---
+texts = df['cleaned_text'].tolist()
+y = df['label'].values
+
+print("🚀 بارگذاری مدل SBERT آغاز شد...")
+# انتخاب یک مدل چندزبانه قوی که برای فارسی هم به خوبی کار می‌کند
+model_name = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2' 
+sbert_model = SentenceTransformer(model_name)
+print(f"✅ مدل SBERT ({model_name}) بارگذاری شد.")
+
+print("🚀 تولید بردارهای معنایی برای داده‌ها...")
+# تولید بردار برای تمامی متون پیش‌پردازش شده
+X_sbert = sbert_model.encode(texts, show_progress_bar=True) 
+
+print(f"✅ تولید بردارها با موفقیت انجام شد. ابعاد ویژگی (X_sbert): {X_sbert.shape}")
+
+# --- ب: تقسیم داده‌ها (۶۰:۳۰:۱۰) ---
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X_sbert, y, test_size=0.4, random_state=42, stratify=y
+)
+validation_ratio_from_temp = 0.25 
+X_test, X_val, y_test, y_val = train_test_split(
+    X_temp, y_temp, 
+    test_size=validation_ratio_from_temp, 
+    random_state=42, 
+    stratify=y_temp
+)
+
+print(f"✅ تقسیم داده‌ها بر اساس نسبت ۶۰:۳۰:۱۰ انجام شد: Train: {len(X_train)}, Test: {len(X_test)}, Validation: {len(X_val)}")
+
+# --- ج: آموزش طبقه‌بند SVM ---
+svm_classifier = SVC(
+    kernel='linear', 
+    C=1.0, 
+    random_state=42, 
+    probability=True
+)
+
+print("\n🚀 آموزش طبقه‌بند SVM با بردارهای SBERT آغاز شد...")
+svm_classifier.fit(X_train, y_train)
+print("✅ آموزش طبقه‌بند با موفقیت به پایان رسید.")
+
+# --- د: پیش‌بینی روی داده‌های تست ---
+y_pred = svm_classifier.predict(X_test)
+y_prob = svm_classifier.predict_proba(X_test)
+# --- تعریف نام دسته‌ها ---
+LABELS = [0, 1, 2]
+CLASS_NAMES = {
+    0: 'Non-related', 
+    1: 'Indirect Suicide Signs', 
+    2: 'Direct Suicide Signs'
+}
+
+# --- الف: محاسبه معیارها و ذخیره در اکسل ---
+
+# ۱. معیارهای اصلی
+accuracy = accuracy_score(y_test, y_pred)
+kappa = cohen_kappa_score(y_test, y_pred)
+mcc = matthews_corrcoef(y_test, y_pred)
+f1_macro = f1_score(y_test, y_pred, average='macro')
+f1_weighted = f1_score(y_test, y_pred, average='weighted')
+mae = mean_absolute_error(y_test, y_pred)
+rmse = math.sqrt(np.mean((y_test - y_pred)**2)) 
+recall_macro = recall_score(y_test, y_pred, average='macro')
+
+# ۲. AUC-ROC (OVR)
+lb = LabelBinarizer()
+y_test_binarized = lb.fit_transform(y_test)
+try:
+    auc_roc_ovr = roc_auc_score(y_test_binarized, y_prob, multi_class='ovr')
+except ValueError:
+    auc_roc_ovr = "N/A"
+
+# ۳. Specificity (برای هر کلاس)
+tn_rate = {}
+for i in LABELS:
+    tn, fp, fn, tp = confusion_matrix(y_test == i, y_pred == i).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 
+    tn_rate[i] = specificity
+
+# ۴. جمع‌آوری و ذخیره در اکسل
+results = {
+    'Metric': [
+        'Accuracy', "Cohen's Kappa", 'MCC', 'F1-score (Macro)', 
+        'F1-score (Weighted)', 'MAE', 'RMSE', 'Macro Average Recall (Sensitivity)', 
+        'AUC-ROC (OVR)'
+    ],
+    'Value': [
+        accuracy, kappa, mcc, f1_macro, f1_weighted, mae, rmse, 
+        recall_macro, auc_roc_ovr
+    ]
+}
+results_df = pd.DataFrame(results)
+
+for label, name in CLASS_NAMES.items():
+    results_df = pd.concat([results_df, pd.DataFrame({
+        'Metric': [f'Specificity ({name})'],
+        'Value': [tn_rate[label]]
+    })], ignore_index=True)
+
+output_results_file = 'SBERT_SVM_Evaluation_Metrics.xlsx'
+results_df.to_excel(output_results_file, index=False)
+files.download(output_results_file)
+print("✅ معیارهای ارزیابی با موفقیت محاسبه و در فایل اکسل ذخیره شدند.")
+
+# --- ب: ترسیم نمودارها ---
+
+# ۱. Confusion Matrix
+cm = confusion_matrix(y_test, y_pred, labels=LABELS)
+cm_df = pd.DataFrame(cm, index=CLASS_NAMES.values(), columns=CLASS_NAMES.values())
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues', linewidths=.5, linecolor='black')
+plt.title('Confusion Matrix (SBERT+SVM)', fontsize=16)
+plt.ylabel('True Label (Actual)', fontsize=14)
+plt.xlabel('Predicted Label', fontsize=14)
+plt.show()
+
+
+# ۲. AUC-ROC Curve per Class
+plt.figure(figsize=(10, 7))
+
+for i in range(len(LABELS)):
+    fpr, tpr, _ = roc_curve(y_test_binarized[:, i], y_prob[:, i])
+    auc_score = roc_auc_score(y_test_binarized[:, i], y_prob[:, i])
+    
+    plt.plot(fpr, tpr, 
+             label=f"Class {LABELS[i]} ({CLASS_NAMES[LABELS[i]]}) AUC = {auc_score:.2f}")
+
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
+plt.ylabel('True Positive Rate (Recall/Sensitivity)', fontsize=12)
+plt.title('AUC-ROC Curve per Class (One-vs-Rest Strategy)', fontsize=16)
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+
+
+print("\n✅ تمامی نمودارهای درخواستی تولید و نمایش داده شدند.")
+print("✅ پیش‌پردازش متن با Parsivar انجام شد.")
