@@ -1,0 +1,104 @@
+# نصب کتابخانه‌های مورد نیاز (Parsivar برای نرمال‌سازی)
+!pip install parsivar scikit-learn numpy scipy pandas openpyxl
+!pip install --upgrade scikit-learn
+
+# ⚠️⚠️⚠️ اجرای دستور ریستارت برای تضمین لود شدن کتابخانه‌ها ⚠️⚠️⚠️
+# پس از اجرای موفقیت‌آمیز این سلول، باید Runtime را ریستارت کنید.
+import os
+print("✅ نصب‌ها تکمیل شد. لطفاً Runtime > Restart runtime را انتخاب کنید.")
+# os.kill(os.getpid(), 9) # اگر خطای ناخواسته داد، این خط را فعال کنید
+
+# --- بخش بارگذاری و پیش‌پردازش (پس از ریستارت) ---
+
+import pandas as pd
+from google.colab import files
+import io
+import re
+import numpy as np
+from parsivar import Normalizer, Tokenizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+
+# --- بارگذاری فایل ---
+print("لطفا فایل اکسل لیبل‌گذاری شده را آپلود کنید:")
+uploaded = files.upload()
+file_name = next(iter(uploaded))
+
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+
+# فرض می‌کنیم ستون اول متن و ستون دوم لیبل باشد.
+df.columns = ['text', 'label'] 
+print(f"✅ فایل با {len(df)} سطر با موفقیت خوانده شد.")
+
+# --- پیش‌پردازش (آماده‌سازی Parsivar) ---
+normalizer = Normalizer()
+tokenizer = Tokenizer()
+# لیست کلمات توقف عمومی فارسی (می‌توانید لیست دقیقتر خود را بارگذاری کنید)
+# برای سادگی، یک لیست عمومی اضافه می‌کنیم.
+stop_words = set([
+    "از", "به", "با", "در", "بر", "برای", "که", "و", "یا", "یک", "این", "آن",
+    "ها", "ای", "را", "هم", "بود", "است", "باشد", "شد", "می", "همین", "چنین",
+    "اما", "اگر", "چون", "تا", "ما", "من", "تو", "او", "شما", "ایشان"
+])
+
+def preprocess_text(text):
+    """تابع جامع پیش‌پردازش متن فارسی با Parsivar"""
+    if pd.isna(text) or not text:
+        return ""
+    
+    # ۱. نرمال‌سازی
+    text = normalizer.normalize(str(text))
+    
+    # ۲. حذف لینک‌ها و هشتگ‌ها
+    text = re.sub(r'http\S+|www\S+|#\w+|@\w+', '', text, flags=re.MULTILINE)
+    
+    # ۳. حذف علائم نگارشی و کاراکترهای غیرضروری
+    text = re.sub(r'[^\u0600-\u06FF\s]', '', text) 
+
+    # ۴. حذف چند فاصله اضافی
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # ۵. توکن‌سازی و حذف کلمات توقف
+    tokens = tokenizer.tokenize_words(text)
+    filtered_tokens = [token for token in tokens if token not in stop_words and len(token) > 1]
+    
+    return ' '.join(filtered_tokens)
+
+# اعمال پیش‌پردازش
+df['cleaned_text'] = df['text'].apply(preprocess_text)
+print("✅ پیش‌پردازش (نرمال‌سازی، حذف Stop-Words و...) انجام شد.")
+
+# --- مهندسی ویژگی با TF-IDF ---
+vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
+X = vectorizer.fit_transform(df['cleaned_text']).toarray()
+y = df['label'].values
+from sklearn.svm import SVC
+
+# --- الف: تقسیم داده‌ها (۶۰:۳۰:۱۰) ---
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.4, random_state=42, stratify=y
+)
+X_test, X_val, y_test, y_val = train_test_split(
+    X_temp, y_temp, test_size=0.25, random_state=42, stratify=y_temp
+)
+
+print(f"✅ تقسیم داده‌ها: Train: {len(X_train)}, Test: {len(X_test)}, Validation: {len(X_val)}")
+
+# --- ب: آموزش مدل SVM (تنظیم C برای جلوگیری از Overfitting) ---
+# C=1.0 یک مقدار پیش‌فرض خوب است. اگر Overfitting مشاهده شد، C را کم کنید (مثل 0.5)
+svm_model = SVC(
+    kernel='linear', 
+    C=1.0, 
+    random_state=42, 
+    probability=True # نیاز برای محاسبه AUC-ROC
+)
+
+print("\n🚀 آموزش مدل SVM آغاز شد...")
+svm_model.fit(X_train, y_train)
+print("✅ آموزش مدل SVM با موفقیت به پایان رسید.")
+
+# --- ج: پیش‌بینی روی داده‌های تست ---
+y_pred = svm_model.predict(X_test)
+y_prob = svm_model.predict_proba(X_test)
+
+print(f"✅ مهندسی ویژگی (TF-IDF) انجام شد. ابعاد ماتریس ویژگی: {X.shape}")
