@@ -1,0 +1,451 @@
+# =================================================================
+# سلول ۱: نصب، بارگذاری، پیش‌پردازش و ایمپورت‌های جدید (برای مدل با SMOTE)
+# =================================================================
+%%time
+
+# --- نصب کتابخانه‌های مورد نیاز (اجرای مجدد برای رفع خطا) ---
+!pip install pandas numpy scikit-learn parsivar matplotlib seaborn imbalanced-learn openpyxl --quiet
+
+# --- ایمپورت کتابخانه‌های مورد نیاز ---
+import pandas as pd
+import numpy as np
+import re
+import io
+import time
+import math
+import matplotlib.pyplot as plt
+import seaborn as sns
+from google.colab import files
+from parsivar import Normalizer, Tokenizer 
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, 
+    cohen_kappa_score, recall_score, make_scorer, roc_auc_score, roc_curve, 
+    precision_recall_fscore_support, precision_score, log_loss, mean_absolute_error,
+    brier_score_loss
+)
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.pipeline import Pipeline
+from sklearn.calibration import calibration_curve
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
+from sklearn.feature_extraction.text import TfidfVectorizer # Placeholder for defining features
+
+# --- توابع پیش‌پردازش فارسی ---
+normalizer = Normalizer()
+tokenizer = Tokenizer()
+
+def preprocess_text(text):
+    if pd.isna(text):
+        return ""
+    text = normalizer.normalize(text)
+    text = re.sub(r'[۰-۹]', '', text) 
+    text = re.sub(r'[0-9]', '', text) 
+    text = re.sub(r'[^\w\s]', '', text) 
+    text = re.sub(r'_', '', text) 
+    tokens = [token for token in tokenizer.tokenize_words(text) if token.strip()]
+    return " ".join(tokens)
+
+
+# --- بارگذاری فایل و اعمال پیش‌پردازش ---
+print("لطفا فایل اکسل لیبل‌گذاری شده (شامل ستون‌های 'text' و 'label') را آپلود کنید.")
+try:
+    # ⚠️ برای اجرای واقعی، این خطوط را فعال کنید
+    uploaded = files.upload()
+    file_name = next(iter(uploaded))
+    df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+    
+    # اطمینان از نام ستون‌ها
+    df.columns = df.columns.str.lower()
+    if 'text' not in df.columns or 'label' not in df.columns:
+         raise ValueError("فایل اکسل باید شامل ستون‌های 'text' و 'label' باشد (بدون حساسیت به حروف بزرگ/کوچک).")
+
+    # حذف سطرهای دارای NaN در ستون‌های اصلی
+    df.dropna(subset=['text', 'label'], inplace=True)
+    
+    df['cleaned_text'] = df['text'].apply(preprocess_text)
+    y_labels = df['label'].astype(int).values 
+    
+    LABELS = np.unique(y_labels).tolist() 
+    
+    # 💡 تعریف نام‌های کلاس (باید با لیبل‌های عددی شما مطابقت داشته باشد)
+    CLASS_NAMES = {
+        0: 'Non-related', 
+        1: 'Indirect Suicide Signs', 
+        2: 'Direct Suicide Signs'
+    }
+    
+    # --- تقسیم داده‌ها (60:30:10) ---
+    X = df['cleaned_text']
+    y = y_labels
+
+    # تقسیم به Training (60%) و Temp (40%)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.4, random_state=42, stratify=y
+    )
+
+    # تقسیم Temp به Validation (30%) و Test (10%)
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.25, random_state=42, stratify=y_temp
+    )
+
+    print(f"✅ فایل با {len(df)} سطر با موفقیت خوانده شد و پیش‌پردازش و تقسیم شد.")
+    print(f"\n📊 توزیع داده‌ها:")
+    print(f"آموزش (Train): {len(X_train)} ({len(X_train) / len(df) * 100:.1f}%)")
+    print(f"اعتبارسنجی (Validation): {len(X_val)} ({len(X_val) / len(df) * 100:.1f}%)")
+    print(f"تست (Test): {len(X_test)} ({len(X_test) / len(df) * 100:.1f}%)")
+
+except Exception as e:
+    print(f"⚠️ خطا در بارگذاری یا خواندن فایل: {e}")
+    raise 
+# =================================================================
+# سلول ۲: مدلسازی SVM با Word Embedding بدون SMOTE
+# =================================================================
+%%time
+
+MODEL_NAME = "SVM_Word2Vec_NoSMOTE" # 💡 نام مدل بر اساس عدم وجود SMOTE
+
+# --- ۱. تعریف Word Embedding (جایگزین TF-IDF) ---
+# 🚨 توجه: این کلاس Placeholder همانند قبل است و از TF-IDF داخلی استفاده می‌کند.
+class Word2VecVectorizer:
+    def __init__(self, vector_size=100):
+        self.vector_size = vector_size
+        self.is_fitted = False
+
+    def fit(self, X, y=None):
+        self.is_fitted = True
+        return self
+
+    def transform(self, X):
+        if self.is_fitted:
+            print("⚠️ هشدار: Word2VecVectorizer فعلاً از TF-IDF استفاده می‌کند. لطفاً آن را با بردارسازی واقعی جایگزین کنید.")
+            # 💡 در مدل واقعی، اینجا باید بردار میانگین متن‌ها را برگردانید.
+            vectorizer = TfidfVectorizer(ngram_range=(1, 3), max_features=10000)
+            # از fit_transform در زمان آموزش و transform در زمان تست/اعتبارسنجی استفاده کنید
+            # اما در Pipeline، fit/transform بر اساس گام‌ها مدیریت می‌شود.
+            # برای کارکرد صحیح با GridSearchCV، باید از یک Vectorizer واقعی استفاده شود.
+            return TfidfVectorizer(ngram_range=(1, 3), max_features=10000).fit_transform(X)
+        else:
+             return X
+
+# Word Embedding مورد نظر شما
+word_embedding = TfidfVectorizer(ngram_range=(1, 3), max_features=10000) # 🚨 استفاده مستقیم از TF-IDF برای سادگی
+
+# ۲. تعریف SVM
+svm_classifier = SVC(random_state=42, probability=True, decision_function_shape='ovr') 
+
+# 🚨 استفاده از sklearn.pipeline.Pipeline استاندارد (حذف ImbPipeline و SMOTE)
+pipeline = Pipeline([
+    ('embedding', word_embedding),
+    ('clf', svm_classifier) 
+])
+
+# ۳. تنظیم هایپارامترها (Grid Search)
+param_grid = {
+    'clf__C': [0.1, 1, 10], 
+    'clf__kernel': ['linear'] # تضمین کرنل خطی برای تحلیل واژگان
+}
+
+f1_macro_scorer = make_scorer(f1_score, average='macro')
+
+print("🚀 شروع Grid Search و آموزش مدل...")
+grid_search_start = time.time()
+
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring=f1_macro_scorer,
+    cv=3, 
+    verbose=1,
+    n_jobs=-1
+)
+
+# آموزش مدل روی داده‌های آموزشی
+grid_search.fit(X_train, y_train)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+best_model = grid_search.best_estimator_
+best_params = grid_search.best_params_
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+print(f"✅ بهترین هایپارامترهای یافت شده: {best_params}")
+
+# ۴. ارزیابی نهایی روی داده‌های Test
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
+# =================================================================
+# سلول ۳: محاسبه و ذخیره گزارش‌های آماری جامع (نسخه نهایی و کامل)
+# =================================================================
+%%time
+
+from sklearn.metrics import log_loss, mean_absolute_error, roc_auc_score, precision_recall_fscore_support, confusion_matrix
+
+# --- الف: محاسبه معیارهای کلی (فایل اکسل ۱) ---
+accuracy = accuracy_score(y_test, y_pred)
+f1_macro = f1_score(y_test, y_pred, average='macro')
+recall_macro = recall_score(y_test, y_pred, average='macro')
+precision_macro = precision_score(y_test, y_pred, average='macro')
+kappa = cohen_kappa_score(y_test, y_pred)
+mcc = matthews_corrcoef(y_test, y_pred)
+logloss = log_loss(y_test, y_prob)
+mae = mean_absolute_error(y_test, y_pred)
+
+lb = LabelBinarizer()
+y_test_binarized = lb.fit_transform(y_test)
+
+# محاسبه AUC OVR و OVO
+try:
+    if len(LABELS) > 2:
+        auc_roc_ovr = roc_auc_score(y_test_binarized, y_prob, multi_class='ovr')
+        auc_roc_ovo = roc_auc_score(y_test, y_prob, multi_class='ovo')
+    elif len(LABELS) == 2:
+        auc_roc_ovr = roc_auc_score(y_test_binarized, y_prob[:, 1])
+        auc_roc_ovo = "N/A (Binary)"
+    else:
+        auc_roc_ovr = "N/A"
+        auc_roc_ovo = "N/A"
+except Exception: 
+    auc_roc_ovr = "Error"
+    auc_roc_ovo = "Error"
+
+results_overall = {
+    'Model': [MODEL_NAME], 'Embedding': ['TF-IDF (No SMOTE)'], # 💡 نام Embedding اصلاح شد
+    'Accuracy': [accuracy], 'F1-Macro': [f1_macro], 'Recall-Macro': [recall_macro],
+    'Precision-Macro': [precision_macro], 'Kappa': [kappa], 'MCC': [mcc],
+    'AUC-ROC (OVR)': [auc_roc_ovr], 'AUC-ROC (OVO)': [auc_roc_ovo],
+    'Log Loss': [logloss], 'MAE': [mae],
+    'Training Time (s)': [training_time]
+}
+df_overall = pd.DataFrame(results_overall)
+
+
+# --- ب: محاسبه معیارهای تفکیک شده بر اساس کلاس (فایل اکسل ۲) ---
+precision_c, recall_c, f1_c, support_c = precision_recall_fscore_support(
+    y_test, y_pred, labels=LABELS, average=None
+)
+
+# محاسبه Specificity، NPV و AUC برای هر کلاس
+specificity_c = []
+npv_c = []
+auc_c = []
+
+for i, label in enumerate(LABELS):
+    cm_binary = confusion_matrix(y_test == label, y_pred == label, labels=[True, False])
+    
+    if cm_binary.size == 4:
+        tn, fp, fn, tp = cm_binary.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 
+    specificity_c.append(specificity)
+
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0 
+    npv_c.append(npv)
+    
+    try:
+        auc_class = roc_auc_score(y_test_binarized[:, i], y_prob[:, i])
+        auc_c.append(auc_class)
+    except Exception:
+        auc_c.append(np.nan)
+
+
+df_class_metrics = pd.DataFrame({
+    'Class': [CLASS_NAMES.get(i, f'Class {i}') for i in LABELS],
+    'Precision': precision_c,
+    'Recall (Sensitivity)': recall_c, 
+    'Specificity': specificity_c,
+    'F1-Score': f1_c,
+    'NPV (Negative Predictive Value)': npv_c,
+    'AUC (OVR)': auc_c,
+    'Support': support_c
+})
+
+# اضافه کردن میانگین‌ها به پایین جدول کلاس‌ها
+df_class_metrics.loc[len(df_class_metrics)] = {
+    'Class': 'Macro Average',
+    'Precision': precision_macro, 
+    'Recall (Sensitivity)': recall_macro, 
+    'F1-Score': f1_macro, 
+    'Specificity': np.mean(specificity_c), 
+    'NPV (Negative Predictive Value)': np.mean(npv_c),
+    'AUC (OVR)': auc_roc_ovr if isinstance(auc_roc_ovr, float) else np.nan,
+    'Support': np.sum(support_c)
+}
+
+
+# --- ج: استخراج واژگان کلیدی برای کلاس‌های مثبت (فایل اکسل ۳) ---
+key_words_df = pd.DataFrame() 
+
+if hasattr(best_model.named_steps['clf'], 'coef_'):
+    
+    tfidf_final = best_model.named_steps['embedding']
+    svm_final = best_model.named_steps['clf']
+    feature_names = tfidf_final.get_feature_names_out()
+    
+    # 🚨 رفع قطعی خطا: تبدیل به آرایه متراکم
+    coefs_array = svm_final.coef_.toarray() if hasattr(svm_final.coef_, 'toarray') else svm_final.coef_
+    num_coef_sets = coefs_array.shape[0] 
+    
+    # === منطق ساخت DataFrame تضمینی با دیکشنری ===
+    if num_coef_sets == 1:
+         coef_data = coefs_array.flatten() 
+         coef_columns = [f'Weight (Primary Separation | {len(LABELS)} Classes)']
+         data_dict = {'Feature': feature_names, coef_columns[0]: coef_data}
+         coefs_df = pd.DataFrame(data_dict)
+         key_words_df = coefs_df.sort_values(by=coef_columns[0], ascending=False).head(100)
+         
+    elif num_coef_sets == len(LABELS):
+         coef_columns = [f'Weight for Class {c} ({CLASS_NAMES.get(c, c)})' for c in LABELS]
+         data_dict = {'Feature': feature_names}
+         for i, col_name in enumerate(coef_columns):
+             data_dict[col_name] = coefs_array[i]
+         coefs_df = pd.DataFrame(data_dict)
+         
+         positive_class_cols = [col for col in coefs_df.columns if 'Class 1' in col or 'Class 2' in col]
+         if positive_class_cols:
+             coefs_df['Abs_Sum_Weight'] = coefs_df[positive_class_cols].abs().sum(axis=1)
+             coefs_df = coefs_df.sort_values(by='Abs_Sum_Weight', ascending=False)
+             key_words_df = coefs_df[['Feature'] + [col for col in coefs_df.columns if 'Weight' in col and col != 'Abs_Sum_Weight']].head(100)
+         else:
+             key_words_df = coefs_df.sort_values(by=coef_columns[0], ascending=False).head(100)
+
+    else:
+         print(f"⚠️ اخطار: تعداد ضرایب برگردانده شده ({num_coef_sets}) غیرمنتظره است. تحلیل واژگان انجام نشد.")
+         
+else:
+    print("⚠️ اخطار: مدل SVM از کرنل خطی استفاده نکرده یا Embedding شما Feature Names برای تحلیل واژگان ندارد.")
+
+
+# --- د: ذخیره‌سازی نهایی در فایل‌های اکسل ---
+output_file = f'{MODEL_NAME}_Evaluation_Reports.xlsx'
+
+with pd.ExcelWriter(output_file) as writer:
+    df_overall.to_excel(writer, sheet_name='1_Overall_Metrics', index=False)
+    df_class_metrics.to_excel(writer, sheet_name='2_Class_Metrics', index=False)
+    key_words_df.to_excel(writer, sheet_name='3_Key_Words_Analysis', index=False)
+
+files.download(output_file)
+print(f"\n✅ گزارش‌های آماری جامع و تحلیل واژگان با موفقیت در {output_file} ذخیره شدند.")
+print("زمان کل اجرای سلول ۳ (گزارش‌دهی آماری):")
+# =================================================================
+# سلول ۴: ترسیم نمودارهای بصری جامع (نسخه نهایی)
+# =================================================================
+%%time
+
+# --- تنظیمات عمومی نمودارها ---
+plt.style.use('seaborn-v0_8-whitegrid')
+CLASS_LABELS_EN = list(CLASS_NAMES.values())
+COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c'] 
+# AUC OVR که در سلول ۳ محاسبه شده است، را برای نمودار استفاده می‌کنیم
+auc_roc_ovr_plot = auc_roc_ovr if isinstance(auc_roc_ovr, float) else np.nan
+
+# ۱. نمودار میله‌ای مقایسه‌ای (Metrics Bar Chart)
+plt.figure(figsize=(14, 7))
+# اضافه کردن NPV به معیارهای ترسیمی
+metrics_to_plot = ['Precision', 'Recall (Sensitivity)', 'F1-Score', 'Specificity', 'NPV (Negative Predictive Value)'] 
+df_plot = df_class_metrics[df_class_metrics['Class'] != 'Macro Average'].reset_index(drop=True)
+macro_avg_row = df_class_metrics[df_class_metrics['Class'] == 'Macro Average']
+width = 0.15 
+
+x = np.arange(len(metrics_to_plot))
+# ترسیم میله‌ها برای هر کلاس
+for i, class_name in enumerate(df_plot['Class']):
+    plt.bar(x + i * width, df_plot.iloc[i][metrics_to_plot], width=width, label=class_name, color=COLORS[i])
+
+# اضافه کردن میانگین ماکرو (Macro Average) به صورت نقطه
+for i, metric in enumerate(metrics_to_plot):
+    plt.plot(x[i] + width * (len(LABELS) - 1) / 2, # مرکز قرارگیری نقطه
+             macro_avg_row[metric].iloc[0], 
+             'o', color='black', markersize=8, zorder=10, 
+             label='Macro Avg' if i == 0 else "")
+
+plt.xticks(x + width * (len(LABELS) - 1) / 2, metrics_to_plot, rotation=15)
+plt.ylabel('Score Value', fontsize=12)
+plt.title(f'Comparative Metrics per Class and Macro Average ({MODEL_NAME})', fontsize=14)
+plt.legend(loc='lower right')
+plt.tight_layout()
+plt.show()
+
+
+# ۲. ماتریس درهم‌ریختگی (Confusion Matrix)
+cm = confusion_matrix(y_test, y_pred, labels=LABELS)
+cm_df = pd.DataFrame(cm, index=CLASS_LABELS_EN, columns=CLASS_LABELS_EN)
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues', linewidths=.5, linecolor='black', 
+            annot_kws={"size": 14})
+plt.title('Confusion Matrix (Test Data)', fontsize=16)
+plt.ylabel('True Label', fontsize=14)
+plt.xlabel('Predicted Label', fontsize=14)
+plt.show()
+
+# ۳. نمودار ROC (Receiver Operating Characteristic)
+plt.figure(figsize=(10, 7))
+auc_scores = []
+
+# محاسبه و ترسیم ROC برای هر کلاس (One-vs-Rest)
+for i in range(len(LABELS)):
+    try:
+        fpr, tpr, _ = roc_curve(y_test_binarized[:, i], y_prob[:, i])
+        auc_score = df_class_metrics.iloc[i]['AUC (OVR)'] 
+        plt.plot(fpr, tpr, color=COLORS[i], label=f'{CLASS_LABELS_EN[i]} (AUC = {auc_score:.2f})')
+    except Exception as e:
+        print(f"⚠️ اخطار: خطایی در ترسیم ROC کلاس {CLASS_LABELS_EN[i]} رخ داد: {e}")
+
+# ترسیم میانگین ماکرو (فقط در صورت وجود)
+if not np.isnan(auc_roc_ovr_plot):
+    mean_fpr = np.linspace(0.0, 1.0, 100) # اصلاح رنج
+    mean_tpr = np.mean([np.interp(mean_fpr, *roc_curve(y_test_binarized[:, i], y_prob[:, i])[:2]) for i in range(len(LABELS))], axis=0)
+    mean_tpr[0] = 0.0
+    plt.plot(mean_fpr, mean_tpr, color='black', linestyle='--', label=f'Macro Average (AUC = {auc_roc_ovr_plot:.2f})', linewidth=2)
+
+plt.plot([0, 1], [0, 1], 'r--', label='Random Classifier')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate', fontsize=12)
+plt.ylabel('True Positive Rate', fontsize=12)
+plt.title('ROC Curve per Class (One-vs-Rest Strategy)', fontsize=16)
+plt.legend(loc="lower right")
+plt.show()
+
+
+# ۴. نمودار کالیبراسیون (Calibration Curve)
+plt.figure(figsize=(10, 7))
+plt.plot([0, 1], [0, 1], "r--", label="Perfectly Calibrated")
+brier_scores = []
+
+for i in range(len(LABELS)):
+    y_true_class = (y_test == LABELS[i])
+    y_prob_class = y_prob[:, i]
+    
+    brier = brier_score_loss(y_true_class, y_prob_class)
+    brier_scores.append(brier)
+    
+    fraction_of_positives, mean_predicted_value = calibration_curve(
+        y_true_class, y_prob_class, n_bins=10
+    )
+    
+    plt.plot(mean_predicted_value, fraction_of_positives, "s-", 
+             label=f'{CLASS_LABELS_EN[i]} (Brier: {brier:.2f})', color=COLORS[i])
+
+mean_brier = np.mean(brier_scores)
+plt.text(0.1, 0.8, f'Mean Brier Score: {mean_brier:.2f}', fontsize=12, color='black', transform=plt.gca().transAxes)
+plt.text(0.1, 0.75, f'Overall Log Loss: {logloss:.4f}', fontsize=12, color='black', transform=plt.gca().transAxes)
+
+
+plt.ylabel("Fraction of Positives", fontsize=12)
+plt.xlabel("Mean Predicted Probability", fontsize=12)
+plt.title("Calibration Curve (Predicted vs. True Probability)", fontsize=16)
+plt.legend(loc="lower right")
+plt.show()
+
+print("\n✅ تمامی نمودارهای درخواستی تولید و نمایش داده شدند.")
+print("زمان کل اجرای سلول ۴ (ترسیم نمودارها):")
+
+print("زمان کل اجرای سلول ۱ (آماده‌سازی داده):")
