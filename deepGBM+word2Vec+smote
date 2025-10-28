@@ -1,0 +1,118 @@
+#تغییر فقط در سلول 2
+  # =================================================================
+# سلول ۲: مدلسازی XGBoost با Word2Vec و SMOTE
+# =================================================================
+%%time
+
+MODEL_NAME = "XGBoost_Word2Vec_SMOTE" 
+
+# --- ۱. تعریف Word2Vec Embedding ---
+
+class Word2VecVectorizer(BaseEstimator, TransformerMixin):
+    """تبدیل کننده متن به بردار میانگین کلمات با استفاده از Gensim Word2Vec."""
+    
+    def __init__(self, vector_size=100, min_count=1, window=5, workers=4):
+        self.vector_size = vector_size
+        self.min_count = min_count
+        self.window = window
+        self.workers = workers
+        self.word2vec_model = None
+
+    def fit(self, X, y=None):
+        # Word2Vec نیاز به لیست توکن‌ها دارد
+        tokenized_sentences = [text.split() for text in X]
+        
+        print(f"🚀 شروع آموزش Word2Vec با vector_size={self.vector_size}...")
+        
+        # 🚨 استفاده از متد Word2Vec
+        self.word2vec_model = gensim.models.Word2Vec(
+            sentences=tokenized_sentences,
+            vector_size=self.vector_size,
+            min_count=self.min_count,
+            window=self.window,
+            workers=self.workers,
+            seed=42
+        )
+        # آموزش مدل
+        self.word2vec_model.train(tokenized_sentences, total_examples=len(tokenized_sentences), epochs=10)
+        print("✅ آموزش Word2Vec به پایان رسید.")
+        return self
+
+    def transform(self, X):
+        tokenized_sentences = [text.split() for text in X]
+        
+        def get_mean_vector(tokens):
+            # فیلتر کردن کلماتی که در واژه‌نامه مدل وجود دارند
+            vectors = [self.word2vec_model.wv[word] for word in tokens if word in self.word2vec_model.wv]
+            if vectors:
+                # محاسبه میانگین بردارهای کلمات
+                return np.mean(vectors, axis=0)
+            else:
+                # برگرداندن یک بردار صفر در صورت خالی بودن سند یا OOV بودن همه کلمات
+                return np.zeros(self.vector_size)
+
+        return np.array([get_mean_vector(tokens) for tokens in tokenized_sentences])
+
+
+# --- ۲. تعریف اجزای Pipeline (با SMOTE) ---
+word2vec_vectorizer = Word2VecVectorizer(vector_size=100) 
+# 👈 استفاده از SMOTE
+smote_sampler = SMOTE(random_state=42) 
+
+xgb_classifier = XGBClassifier(
+    objective='multi:softprob', 
+    eval_metric='mlogloss', 
+    use_label_encoder=False, 
+    random_state=42
+) 
+
+# 🚨 استفاده از ImbPipeline برای اعمال SMOTE
+pipeline = ImbPipeline([
+    ('embedding', word2vec_vectorizer),
+    ('smote', smote_sampler), # 👈 مرحله SMOTE
+    ('clf', xgb_classifier) 
+])
+
+# --- ۳. تنظیم هایپارامترها (Grid Search) ---
+param_grid = {
+    # هایپارامترهای Word2Vec
+    'embedding__vector_size': [100, 200], 
+    # 💡 هایپارامترهای SMOTE
+    'smote__k_neighbors': [3, 5], 
+    # هایپارامترهای XGBoost
+    'clf__n_estimators': [100, 200], 
+    'clf__max_depth': [5, 7], 
+    'clf__learning_rate': [0.1, 0.2] 
+}
+
+f1_macro_scorer = make_scorer(f1_score, average='macro')
+
+print("🚀 شروع Grid Search و آموزش مدل...")
+grid_search_start = time.time()
+
+# اجرای Grid Search
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring=f1_macro_scorer,
+    cv=3, 
+    verbose=1,
+    n_jobs=-1
+)
+
+grid_search.fit(X_train, y_train)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+best_model = grid_search.best_estimator_
+best_params = grid_search.best_params_
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+print(f"✅ بهترین هایپارامترهای یافت شده: {best_params}")
+
+# ۴. ارزیابی نهایی روی داده‌های Test
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
