@@ -1,0 +1,86 @@
+#تغییر در ساول  دوم
+  # =================================================================
+# سلول ۲: مدلسازی XGBoost با TF-IDF و SMOTE
+# =================================================================
+%%time
+
+MODEL_NAME = "XGBoost_TFIDF_SMOTE" 
+
+# --- ۱. تعریف اجزای Pipeline ---
+from sklearn.feature_extraction.text import TfidfVectorizer 
+from imblearn.pipeline import Pipeline as ImbPipeline 
+from imblearn.over_sampling import SMOTE 
+from xgboost import XGBClassifier
+from sklearn.metrics import make_scorer, f1_score
+from sklearn.model_selection import GridSearchCV
+import time
+
+# 🚨 TF-IDFVectorizer (Embedding سنتی اول)
+tfidf_vectorizer = TfidfVectorizer(
+    ngram_range=(1, 3), 
+    max_features=10000, 
+    min_df=5 
+)
+
+# 🚨 SMOTE Sampler
+smote_sampler = SMOTE(random_state=42) 
+
+# XGBoost Classifier
+xgb_classifier = XGBClassifier(
+    objective='multi:softprob', 
+    eval_metric='mlogloss', 
+    use_label_encoder=False, 
+    random_state=42
+) 
+
+# 🚨 استفاده از ImbPipeline برای اعمال SMOTE
+pipeline = ImbPipeline([
+    ('tfidf', tfidf_vectorizer), # مرحله ۱: تبدیل متن به بردار 
+    ('smote', smote_sampler),    # مرحله ۲: متعادل‌سازی کلاس‌ها (فقط روی داده آموزش)
+    ('clf', xgb_classifier)      # مرحله ۳: آموزش مدل
+])
+
+# --- ۲. تنظیم هایپارامترها (Grid Search) ---
+param_grid = {
+    # هایپارامترهای TF-IDF
+    'tfidf__max_features': [5000, 10000], 
+    # 💡 هایپارامترهای SMOTE (تعداد همسایه‌ها)
+    'smote__k_neighbors': [3, 5], 
+    # هایپارامترهای XGBoost
+    'clf__n_estimators': [100, 200], 
+    'clf__max_depth': [5, 7], 
+    'clf__learning_rate': [0.1, 0.2] 
+}
+
+f1_macro_scorer = make_scorer(f1_score, average='macro')
+
+print("🚀 شروع Grid Search و آموزش مدل...")
+grid_search_start = time.time()
+
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring=f1_macro_scorer,
+    cv=3, 
+    verbose=1,
+    n_jobs=-1
+)
+
+# آموزش مدل روی داده‌های آموزشی (شامل SMOTE)
+grid_search.fit(X_train, y_train)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+best_model = grid_search.best_estimator_
+best_params = grid_search.best_params_
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+print(f"✅ بهترین هایپارامترهای یافت شده: {best_params}")
+
+# ۴. ارزیابی نهایی روی داده‌های Test
+# مرحله SMOTE در فاز تست Pipeline نادیده گرفته می‌شود.
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
