@@ -1,10 +1,11 @@
 # =================================================================
-# سلول ۱: نصب، بارگذاری، پیش‌پردازش و ایمپورت‌های جدید (برای مدل با SMOTE)
+# سلول ۱: نصب، بارگذاری، پیش‌پردازش و ایمپورت‌های نهایی (Word2Vec)
 # =================================================================
 %%time
 
-# --- نصب کتابخانه‌های مورد نیاز (اجرای مجدد برای رفع خطا) ---
-!pip install pandas numpy scikit-learn parsivar matplotlib seaborn imbalanced-learn openpyxl --quiet
+# --- نصب کتابخانه‌های مورد نیاز ---
+# نصب تمام پکیج‌های مورد نیاز شامل parsivar، imbalanced-learn و gensim
+!pip install pandas numpy scikit-learn parsivar matplotlib seaborn imbalanced-learn openpyxl gensim --quiet
 
 # --- ایمپورت کتابخانه‌های مورد نیاز ---
 import pandas as pd
@@ -28,35 +29,42 @@ from sklearn.metrics import (
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.pipeline import Pipeline
 from sklearn.calibration import calibration_curve
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-from sklearn.feature_extraction.text import TfidfVectorizer # Placeholder for defining features
+from imblearn.pipeline import Pipeline as ImbPipeline 
+from imblearn.over_sampling import SMOTE 
+from sklearn.feature_extraction.text import TfidfVectorizer 
+import gensim.models
 
 # --- توابع پیش‌پردازش فارسی ---
 normalizer = Normalizer()
 tokenizer = Tokenizer()
 
 def preprocess_text(text):
+    """اعمال نرمال‌سازی و توکن‌سازی اولیه روی متن فارسی."""
     if pd.isna(text):
         return ""
+    # نرمال‌سازی فارسی (اصلاح نیم‌فاصله، ک‌ها، ی‌ها و...)
     text = normalizer.normalize(text)
+    # حذف اعداد
     text = re.sub(r'[۰-۹]', '', text) 
     text = re.sub(r'[0-9]', '', text) 
+    # حذف علائم نگارشی (به جز کاراکترهای مجاز)
     text = re.sub(r'[^\w\s]', '', text) 
+    # حذف زیرخط‌ها
     text = re.sub(r'_', '', text) 
+    # توکن‌سازی و حذف توکن‌های خالی
     tokens = [token for token in tokenizer.tokenize_words(text) if token.strip()]
     return " ".join(tokens)
 
 
 # --- بارگذاری فایل و اعمال پیش‌پردازش ---
-print("لطفا فایل اکسل لیبل‌گذاری شده (شامل ستون‌های 'text' و 'label') را آپلود کنید.")
+print("\n🔄 لطفا فایل اکسل لیبل‌گذاری شده (شامل ستون‌های 'text' و 'label') را آپلود کنید.")
 try:
-    # ⚠️ برای اجرای واقعی، این خطوط را فعال کنید
+    # بخش آپلود
     uploaded = files.upload()
     file_name = next(iter(uploaded))
     df = pd.read_excel(io.BytesIO(uploaded[file_name]))
     
-    # اطمینان از نام ستون‌ها
+    # اطمینان از نام ستون‌ها و تبدیل به حروف کوچک
     df.columns = df.columns.str.lower()
     if 'text' not in df.columns or 'label' not in df.columns:
          raise ValueError("فایل اکسل باید شامل ستون‌های 'text' و 'label' باشد (بدون حساسیت به حروف بزرگ/کوچک).")
@@ -64,87 +72,123 @@ try:
     # حذف سطرهای دارای NaN در ستون‌های اصلی
     df.dropna(subset=['text', 'label'], inplace=True)
     
+    # اعمال پیش‌پردازش
     df['cleaned_text'] = df['text'].apply(preprocess_text)
-    y_labels = df['label'].astype(int).values 
     
+    # تبدیل لیبل‌ها به عدد صحیح
+    y_labels = df['label'].astype(int).values 
     LABELS = np.unique(y_labels).tolist() 
     
-    # 💡 تعریف نام‌های کلاس (باید با لیبل‌های عددی شما مطابقت داشته باشد)
+    # 💡 تعریف نام‌های کلاس (بر اساس لیبل‌های عددی شما)
     CLASS_NAMES = {
         0: 'Non-related', 
         1: 'Indirect Suicide Signs', 
         2: 'Direct Suicide Signs'
     }
     
-    # --- تقسیم داده‌ها (60:30:10) ---
+    # --- تقسیم داده‌ها (60% آموزش، 30% اعتبارسنجی، 10% تست) ---
     X = df['cleaned_text']
     y = y_labels
 
-    # تقسیم به Training (60%) و Temp (40%)
+    # 1. تقسیم به Training (60%) و Temp (40%)
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, random_state=42, stratify=y
     )
 
-    # تقسیم Temp به Validation (30%) و Test (10%)
+    # 2. تقسیم Temp به Validation (30%) و Test (10%)
     X_val, X_test, y_val, y_test = train_test_split(
         X_temp, y_temp, test_size=0.25, random_state=42, stratify=y_temp
     )
 
-    print(f"✅ فایل با {len(df)} سطر با موفقیت خوانده شد و پیش‌پردازش و تقسیم شد.")
+    print(f"\n✅ فایل با {len(df)} سطر با موفقیت خوانده شد و پیش‌پردازش و تقسیم شد.")
     print(f"\n📊 توزیع داده‌ها:")
     print(f"آموزش (Train): {len(X_train)} ({len(X_train) / len(df) * 100:.1f}%)")
     print(f"اعتبارسنجی (Validation): {len(X_val)} ({len(X_val) / len(df) * 100:.1f}%)")
     print(f"تست (Test): {len(X_test)} ({len(X_test) / len(df) * 100:.1f}%)")
 
 except Exception as e:
-    print(f"⚠️ خطا در بارگذاری یا خواندن فایل: {e}")
+    print(f"❌ خطا در بارگذاری یا خواندن فایل: {e}")
+    # اگر فایل آپلود نشود، اجرای نوت‌بوک متوقف می‌شود
+    # توجه: اگر فایل قبلاً در حافظه Colab باشد، ممکن است این بخش نیاز به تغییر داشته باشد.
     raise 
 # =================================================================
-# سلول ۲: مدلسازی SVM با Word Embedding بدون SMOTE
+# سلول ۲: مدلسازی SVM با Word2Vec واقعی (Gensim) و بدون SMOTE - رفع خطای set_params
 # =================================================================
 %%time
 
-MODEL_NAME = "SVM_Word2Vec_NoSMOTE" # 💡 نام مدل بر اساس عدم وجود SMOTE
+MODEL_NAME = "SVM_Gensim_Word2Vec" 
 
-# --- ۱. تعریف Word Embedding (جایگزین TF-IDF) ---
-# 🚨 توجه: این کلاس Placeholder همانند قبل است و از TF-IDF داخلی استفاده می‌کند.
-class Word2VecVectorizer:
-    def __init__(self, vector_size=100):
+# 🚨 ایمپورت کلاس‌های پایه Scikit-learn
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# --- ۱. تعریف Word Embedding (Gensim Word2Vec) ---
+
+class Word2VecVectorizer(BaseEstimator, TransformerMixin): # 💡 وراثت‌های جدید
+    """تبدیل کننده متن به بردار میانگین کلمات با استفاده از Gensim Word2Vec."""
+    
+    # 🚨 دقت کنید که تمام هایپارامترها باید در متد __init__ تعریف شوند.
+    def __init__(self, vector_size=100, min_count=1, window=5, workers=4):
+        # ذخیره هایپارامترها به عنوان ویژگی (attribute) کلاس
         self.vector_size = vector_size
-        self.is_fitted = False
+        self.min_count = min_count
+        self.window = window
+        self.workers = workers
+        self.word2vec_model = None
+        
+        # 💡 نکته: اگر از TransformerMixin و BaseEstimator ارث ببرید، نیازی به تعریف 
+        # set_params و get_params نیست، چون این متدها از کلاس‌های والد به ارث می‌رسند.
 
     def fit(self, X, y=None):
-        self.is_fitted = True
+        # Word2Vec نیاز به لیست توکن‌ها دارد، نه متن‌های پیوسته
+        # X در اینجا لیست متن‌های تمیز شده است (cleaned_text)
+        tokenized_sentences = [text.split() for text in X]
+        
+        print(f"🚀 شروع آموزش Word2Vec با vector_size={self.vector_size}...")
+        self.word2vec_model = gensim.models.Word2Vec(
+            sentences=tokenized_sentences,
+            vector_size=self.vector_size,
+            min_count=self.min_count,
+            window=self.window,
+            workers=self.workers,
+            seed=42
+        )
+        self.word2vec_model.train(tokenized_sentences, total_examples=len(tokenized_sentences), epochs=10)
+        print("✅ آموزش Word2Vec به پایان رسید.")
         return self
 
     def transform(self, X):
-        if self.is_fitted:
-            print("⚠️ هشدار: Word2VecVectorizer فعلاً از TF-IDF استفاده می‌کند. لطفاً آن را با بردارسازی واقعی جایگزین کنید.")
-            # 💡 در مدل واقعی، اینجا باید بردار میانگین متن‌ها را برگردانید.
-            vectorizer = TfidfVectorizer(ngram_range=(1, 3), max_features=10000)
-            # از fit_transform در زمان آموزش و transform در زمان تست/اعتبارسنجی استفاده کنید
-            # اما در Pipeline، fit/transform بر اساس گام‌ها مدیریت می‌شود.
-            # برای کارکرد صحیح با GridSearchCV، باید از یک Vectorizer واقعی استفاده شود.
-            return TfidfVectorizer(ngram_range=(1, 3), max_features=10000).fit_transform(X)
-        else:
-             return X
+        tokenized_sentences = [text.split() for text in X]
+        
+        # تابع کمکی برای محاسبه میانگین برداری یک سند
+        def get_mean_vector(tokens):
+            # فیلتر کردن کلماتی که در واژه‌نامه مدل Word2Vec وجود دارند
+            words = [word for word in tokens if word in self.word2vec_model.wv]
+            if words:
+                # محاسبه میانگین بردارهای کلمات موجود
+                return np.mean(self.word2vec_model.wv[words], axis=0)
+            else:
+                # برگرداندن یک بردار صفر در صورت نبود کلمات
+                return np.zeros(self.vector_size)
 
-# Word Embedding مورد نظر شما
-word_embedding = TfidfVectorizer(ngram_range=(1, 3), max_features=10000) # 🚨 استفاده مستقیم از TF-IDF برای سادگی
+        # محاسبه میانگین برداری برای هر سند در مجموعه X
+        return np.array([get_mean_vector(tokens) for tokens in tokenized_sentences])
 
-# ۲. تعریف SVM
+
+# --- تعریف اجزای Pipeline ---
+word2vec_vectorizer = Word2VecVectorizer(vector_size=100) # می‌توانید اندازه بردار را تنظیم کنید
 svm_classifier = SVC(random_state=42, probability=True, decision_function_shape='ovr') 
 
-# 🚨 استفاده از sklearn.pipeline.Pipeline استاندارد (حذف ImbPipeline و SMOTE)
 pipeline = Pipeline([
-    ('embedding', word_embedding),
+    ('embedding', word2vec_vectorizer),
     ('clf', svm_classifier) 
 ])
 
-# ۳. تنظیم هایپارامترها (Grid Search)
+# --- تنظیم هایپارامترها (Grid Search) ---
 param_grid = {
-    'clf__C': [0.1, 1, 10], 
-    'clf__kernel': ['linear'] # تضمین کرنل خطی برای تحلیل واژگان
+    # اکنون Grid Search می‌تواند این هایپارامترها را تنظیم کند
+    'embedding__vector_size': [50, 100], 
+    'clf__C': [1, 10], 
+    'clf__kernel': ['linear'] 
 }
 
 f1_macro_scorer = make_scorer(f1_score, average='macro')
@@ -152,6 +196,7 @@ f1_macro_scorer = make_scorer(f1_score, average='macro')
 print("🚀 شروع Grid Search و آموزش مدل...")
 grid_search_start = time.time()
 
+# 🚨 اجرای Grid Search
 grid_search = GridSearchCV(
     estimator=pipeline,
     param_grid=param_grid,
@@ -161,7 +206,6 @@ grid_search = GridSearchCV(
     n_jobs=-1
 )
 
-# آموزش مدل روی داده‌های آموزشی
 grid_search.fit(X_train, y_train)
 
 grid_search_end = time.time()
@@ -179,7 +223,7 @@ y_prob = best_model.predict_proba(X_test)
 
 print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
 # =================================================================
-# سلول ۳: محاسبه و ذخیره گزارش‌های آماری جامع (نسخه نهایی و کامل)
+# سلول ۳: محاسبه و ذخیره گزارش‌های آماری جامع (نسخه نهایی و Word2Vec)
 # =================================================================
 %%time
 
@@ -214,7 +258,7 @@ except Exception:
     auc_roc_ovo = "Error"
 
 results_overall = {
-    'Model': [MODEL_NAME], 'Embedding': ['TF-IDF (No SMOTE)'], # 💡 نام Embedding اصلاح شد
+    'Model': [MODEL_NAME], 'Embedding': ['Word2Vec (Gensim)'],
     'Accuracy': [accuracy], 'F1-Macro': [f1_macro], 'Recall-Macro': [recall_macro],
     'Precision-Macro': [precision_macro], 'Kappa': [kappa], 'MCC': [mcc],
     'AUC-ROC (OVR)': [auc_roc_ovr], 'AUC-ROC (OVO)': [auc_roc_ovo],
@@ -235,6 +279,7 @@ npv_c = []
 auc_c = []
 
 for i, label in enumerate(LABELS):
+    # محاسبه TN, FP, FN, TP برای هر کلاس (True vs. Not-True)
     cm_binary = confusion_matrix(y_test == label, y_pred == label, labels=[True, False])
     
     if cm_binary.size == 4:
@@ -242,12 +287,15 @@ for i, label in enumerate(LABELS):
     else:
         tn, fp, fn, tp = 0, 0, 0, 0
 
+    # Specificity
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 
     specificity_c.append(specificity)
 
+    # NPV
     npv = tn / (tn + fn) if (tn + fn) > 0 else 0 
     npv_c.append(npv)
     
+    # محاسبه AUC برای هر کلاس
     try:
         auc_class = roc_auc_score(y_test_binarized[:, i], y_prob[:, i])
         auc_c.append(auc_class)
@@ -279,51 +327,17 @@ df_class_metrics.loc[len(df_class_metrics)] = {
 }
 
 
-# --- ج: استخراج واژگان کلیدی برای کلاس‌های مثبت (فایل اکسل ۳) ---
-key_words_df = pd.DataFrame() 
-
-if hasattr(best_model.named_steps['clf'], 'coef_'):
-    
-    tfidf_final = best_model.named_steps['embedding']
-    svm_final = best_model.named_steps['clf']
-    feature_names = tfidf_final.get_feature_names_out()
-    
-    # 🚨 رفع قطعی خطا: تبدیل به آرایه متراکم
-    coefs_array = svm_final.coef_.toarray() if hasattr(svm_final.coef_, 'toarray') else svm_final.coef_
-    num_coef_sets = coefs_array.shape[0] 
-    
-    # === منطق ساخت DataFrame تضمینی با دیکشنری ===
-    if num_coef_sets == 1:
-         coef_data = coefs_array.flatten() 
-         coef_columns = [f'Weight (Primary Separation | {len(LABELS)} Classes)']
-         data_dict = {'Feature': feature_names, coef_columns[0]: coef_data}
-         coefs_df = pd.DataFrame(data_dict)
-         key_words_df = coefs_df.sort_values(by=coef_columns[0], ascending=False).head(100)
-         
-    elif num_coef_sets == len(LABELS):
-         coef_columns = [f'Weight for Class {c} ({CLASS_NAMES.get(c, c)})' for c in LABELS]
-         data_dict = {'Feature': feature_names}
-         for i, col_name in enumerate(coef_columns):
-             data_dict[col_name] = coefs_array[i]
-         coefs_df = pd.DataFrame(data_dict)
-         
-         positive_class_cols = [col for col in coefs_df.columns if 'Class 1' in col or 'Class 2' in col]
-         if positive_class_cols:
-             coefs_df['Abs_Sum_Weight'] = coefs_df[positive_class_cols].abs().sum(axis=1)
-             coefs_df = coefs_df.sort_values(by='Abs_Sum_Weight', ascending=False)
-             key_words_df = coefs_df[['Feature'] + [col for col in coefs_df.columns if 'Weight' in col and col != 'Abs_Sum_Weight']].head(100)
-         else:
-             key_words_df = coefs_df.sort_values(by=coef_columns[0], ascending=False).head(100)
-
-    else:
-         print(f"⚠️ اخطار: تعداد ضرایب برگردانده شده ({num_coef_sets}) غیرمنتظره است. تحلیل واژگان انجام نشد.")
-         
-else:
-    print("⚠️ اخطار: مدل SVM از کرنل خطی استفاده نکرده یا Embedding شما Feature Names برای تحلیل واژگان ندارد.")
+# --- ج: استخراج واژگان کلیدی (فایل اکسل ۳ - غیرقابل اجرا برای Word2Vec) ---
+key_words_df = pd.DataFrame({
+    'Feature': ['N/A (Word2Vec Embeddings are dense vectors)'],
+    'Weight': ['Key word analysis not applicable for this embedding type.']
+}) 
+print("⚠️ اخطار: تحلیل واژگان کلیدی برای Embeddingهای Word2Vec معنی‌دار نیست و حذف شد.")
 
 
 # --- د: ذخیره‌سازی نهایی در فایل‌های اکسل ---
 output_file = f'{MODEL_NAME}_Evaluation_Reports.xlsx'
+from google.colab import files # ایمپورت مجدد در صورت نیاز
 
 with pd.ExcelWriter(output_file) as writer:
     df_overall.to_excel(writer, sheet_name='1_Overall_Metrics', index=False)
@@ -347,7 +361,6 @@ auc_roc_ovr_plot = auc_roc_ovr if isinstance(auc_roc_ovr, float) else np.nan
 
 # ۱. نمودار میله‌ای مقایسه‌ای (Metrics Bar Chart)
 plt.figure(figsize=(14, 7))
-# اضافه کردن NPV به معیارهای ترسیمی
 metrics_to_plot = ['Precision', 'Recall (Sensitivity)', 'F1-Score', 'Specificity', 'NPV (Negative Predictive Value)'] 
 df_plot = df_class_metrics[df_class_metrics['Class'] != 'Macro Average'].reset_index(drop=True)
 macro_avg_row = df_class_metrics[df_class_metrics['Class'] == 'Macro Average']
@@ -360,7 +373,7 @@ for i, class_name in enumerate(df_plot['Class']):
 
 # اضافه کردن میانگین ماکرو (Macro Average) به صورت نقطه
 for i, metric in enumerate(metrics_to_plot):
-    plt.plot(x[i] + width * (len(LABELS) - 1) / 2, # مرکز قرارگیری نقطه
+    plt.plot(x[i] + width * (len(LABELS) - 1) / 2, 
              macro_avg_row[metric].iloc[0], 
              'o', color='black', markersize=8, zorder=10, 
              label='Macro Avg' if i == 0 else "")
@@ -400,7 +413,8 @@ for i in range(len(LABELS)):
 
 # ترسیم میانگین ماکرو (فقط در صورت وجود)
 if not np.isnan(auc_roc_ovr_plot):
-    mean_fpr = np.linspace(0.0, 1.0, 100) # اصلاح رنج
+    mean_fpr = np.linspace(0.0, 1.0, 100) 
+    # میانگین‌گیری از منحنی‌های ROC با استفاده از درون‌یابی
     mean_tpr = np.mean([np.interp(mean_fpr, *roc_curve(y_test_binarized[:, i], y_prob[:, i])[:2]) for i in range(len(LABELS))], axis=0)
     mean_tpr[0] = 0.0
     plt.plot(mean_fpr, mean_tpr, color='black', linestyle='--', label=f'Macro Average (AUC = {auc_roc_ovr_plot:.2f})', linewidth=2)
@@ -447,5 +461,4 @@ plt.show()
 
 print("\n✅ تمامی نمودارهای درخواستی تولید و نمایش داده شدند.")
 print("زمان کل اجرای سلول ۴ (ترسیم نمودارها):")
-
-print("زمان کل اجرای سلول ۱ (آماده‌سازی داده):")
+print("\nزمان کل اجرای سلول ۱ (آماده‌سازی داده):")
