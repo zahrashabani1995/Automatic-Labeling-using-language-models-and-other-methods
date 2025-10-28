@@ -1,0 +1,123 @@
+#سلول دوم
+# =================================================================
+# سلول ۲: مدلسازی XGBoost با FastText و بدون هیچ گونه متعادل‌سازی
+# =================================================================
+%%time
+
+MODEL_NAME = "XGBoost_FastText_NoBalance" 
+
+# --- ۱. تعریف FastText Embedding ---
+
+class FastTextVectorizer(BaseEstimator, TransformerMixin):
+    """تبدیل کننده متن به بردار میانگین کلمات با استفاده از Gensim FastText."""
+    
+    def __init__(self, vector_size=100, min_count=1, window=5, workers=4, min_n=3, max_n=6):
+        self.vector_size = vector_size
+        self.min_count = min_count
+        self.window = window
+        self.workers = workers
+        self.min_n = min_n 
+        self.max_n = max_n 
+        self.fasttext_model = None
+
+    def fit(self, X, y=None):
+        from gensim.models.fasttext import FastText as FastTextModel 
+        import gensim.models # برای اطمینان از دسترسی به ایمپورت اصلی
+        
+        tokenized_sentences = [text.split() for text in X]
+        
+        print(f"🚀 شروع آموزش FastText با vector_size={self.vector_size}, min_n={self.min_n}...")
+        
+        self.fasttext_model = FastTextModel(
+            sentences=tokenized_sentences,
+            vector_size=self.vector_size,
+            min_count=self.min_count,
+            window=self.window,
+            workers=self.workers,
+            min_n=self.min_n, 
+            max_n=self.max_n, 
+            seed=42
+        )
+        self.fasttext_model.train(tokenized_sentences, total_examples=len(tokenized_sentences), epochs=10)
+        print("✅ آموزش FastText به پایان رسید.")
+        return self
+
+    def transform(self, X):
+        tokenized_sentences = [text.split() for text in X]
+        
+        def get_mean_vector(tokens):
+            # فیلتر کردن کلماتی که در مدل وجود دارند و محاسبه بردار میانگین
+            vectors = [self.fasttext_model.wv[word] for word in tokens if word in self.fasttext_model.wv]
+            if vectors:
+                return np.mean(vectors, axis=0)
+            else:
+                return np.zeros(self.vector_size)
+
+        return np.array([get_mean_vector(tokens) for tokens in tokenized_sentences])
+
+
+# --- ۲. تعریف اجزای Pipeline (بدون Sampler) ---
+from sklearn.pipeline import Pipeline
+from xgboost import XGBClassifier
+from sklearn.metrics import make_scorer, f1_score
+from sklearn.model_selection import GridSearchCV
+import time
+from sklearn.base import BaseEstimator, TransformerMixin 
+import numpy as np # برای اطمینان از دسترسی به numpy در داخل کلاس
+
+fasttext_vectorizer = FastTextVectorizer(vector_size=200) 
+
+xgb_classifier = XGBClassifier(
+    objective='multi:softprob', 
+    eval_metric='mlogloss', 
+    use_label_encoder=False, 
+    random_state=42
+) 
+
+# 🚨 استفاده از Pipeline استاندارد (فاقد هرگونه متعادل‌سازی)
+pipeline = Pipeline([
+    ('embedding', fasttext_vectorizer),
+    ('clf', xgb_classifier) 
+])
+
+# --- ۳. تنظیم هایپارامترها (Grid Search) ---
+param_grid = {
+    # هایپارامترهای FastText
+    'embedding__vector_size': [100, 200], 
+    # هایپارامترهای XGBoost
+    'clf__n_estimators': [100, 200], 
+    'clf__max_depth': [5, 7], 
+    'clf__learning_rate': [0.1, 0.2] 
+}
+
+f1_macro_scorer = make_scorer(f1_score, average='macro')
+
+print("🚀 شروع Grid Search و آموزش مدل...")
+grid_search_start = time.time()
+
+# اجرای Grid Search
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring=f1_macro_scorer,
+    cv=3, 
+    verbose=1,
+    n_jobs=-1
+)
+
+grid_search.fit(X_train, y_train)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+best_model = grid_search.best_estimator_
+best_params = grid_search.best_params_
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+print(f"✅ بهترین هایپارامترهای یافت شده: {best_params}")
+
+# ۴. ارزیابی نهایی روی داده‌های Test
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
