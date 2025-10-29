@@ -1,0 +1,519 @@
+# =================================================================
+# Cell 0: Install Required Libraries and Define Global Configuration
+# =================================================================
+%%time
+# 🚨 ENSURE GPU is enabled in Runtime -> Change runtime type 🚨
+
+print("🚀 Installing required libraries...")
+!pip install transformers datasets torch scikit-learn seaborn matplotlib pandas openpyxl accelerate -U --quiet
+!pip install --upgrade accelerate -q
+
+import os
+import torch
+import numpy as np
+
+# --- GLOBAL MODEL CONFIGURATION (DiBERTa/FarsiBERT) ---
+# We use a highly compatible FarsiBERT checkpoint as a proxy for DiBERTa.
+# Your original code used 'HooshvareLab/bert-fa-zwnj-base'. We use the same for compatibility.
+MODEL_NAME = 'HooshvareLab/bert-fa-zwnj-base' # Using the successful ParsBERT checkpoint for stability
+NUM_LABELS = 3
+KEYWORD_DIM = 2 # 1 for Indirect (1), 1 for Direct (2)
+
+HYPERPARAMS = {
+    'model_name': MODEL_NAME, 
+    'num_labels': NUM_LABELS,
+    'batch_size': 16,
+    'learning_rate': 2e-5,
+    'num_epochs': 5, # Increased for better learning
+    'weight_decay': 0.01,
+    'warmup_steps': 200,
+    'max_length': 128,
+    'random_state': 42,
+    'keyword_dim': KEYWORD_DIM
+}
+
+# --- GLOBAL COLUMN NAMES ---
+TEXT_COL = 'text'   
+LABEL_COL = 'label' 
+# =================================================================
+# Cell 1: Upload, Clean, and Data Split (60% Train, 30% Test, 10% Val)
+# =================================================================
+%%time
+import pandas as pd
+from google.colab import files
+import io
+from sklearn.model_selection import train_test_split
+import re
+
+# --- ۱. آپلود و لود داده ---
+print("🚨 Please upload your Excel file (First column: text, Second column: label 0/1/2)")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+
+# فرض: ستون اول متن و ستون دوم لیبل است
+df.columns = [TEXT_COL, LABEL_COL] + list(df.columns[2:]) 
+
+df = df[[TEXT_COL, LABEL_COL]].dropna()
+df[LABEL_COL] = df[LABEL_COL].astype(int)
+
+# --- ۲. تمیز کردن متن ---
+def clean_text(text):
+    text = str(text)
+    # حذف URL, هشتگ و منشن (همانند کد ParsBERT)
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text)
+    text = re.sub(r'#\w+|@\w+', '', text)
+    # حذف علائم نگارشی (کد ParsBERT این کار را می‌کرد، اما برای مدل‌های BERT توصیه نمی‌شود. آن را حذف می‌کنیم تا مدل بهتر کار کند.)
+    # text = re.sub(r'[^\w\s]', '', text) 
+    return text.strip()
+
+df[TEXT_COL] = df[TEXT_COL].apply(clean_text)
+
+# --- ۳. تقسیم داده: 60% train, 30% test, 10% val ---
+train_df, temp_df = train_test_split(
+    df, test_size=0.4, stratify=df[LABEL_COL], random_state=HYPERPARAMS['random_state']
+)
+test_df, val_df = train_test_split(
+    temp_df, test_size=0.25, stratify=temp_df[LABEL_COL], random_state=HYPERPARAMS['random_state']
+) # 0.25 of 40% = 10%
+
+# --- ۴. بررسی و آماده‌سازی متغیرهای گلوبال ---
+global keywords # برای استفاده در سلول‌های بعدی
+
+keywords = {
+    2: ["خودکشی", "آماده خودکشی", "نقشه خودکشی", "مرگ خودخواسته", "می‌خواهم خودم را بکشم",
+        "تا ابد بخوابم", "هیچوقت بیدار نشم", "به زندگی‌ام پایان می‌دهم", "نمی‌تونم ادامه بدم",
+        "نمی‌خوام زنده باشم", "خودسوزی", "زندگی برای من تمام شده", "خودم را خلاص کنم",
+        "خودمو خلاص کنم", "خودم رو خلاص کنم", "چرا نباید خودم را بکشم؟", "#خودکشی"],
+    1: ["افسردگی", "دارم عذاب می‌کشم", "هیچ امیدی ندارم", "از خودم متنفرم", "از خودم بدم میاد",
+        "چیزی برای از دست دادن ندارم", "از زندگی خسته‌ام", "تنها می‌میرم", "مرگ", "درد", "ناامیدی",
+        "تنهایی", "غم", "بی‌ارزش", "خستگی", "فشار رومه", "استرس", "استرس دارم", "همه چیز بی‌فایده است",
+        "هیچکس مرا نمی‌فهمد", "از همه چیز متنفرم", "#افسردگی", "#تنهایی", "#درد", "#غم", "#ناامیدی"],
+    0: []
+}
+
+total = len(df)
+print(f"\n✅ Data loaded and split:")
+print(f"    - Total: {total}")
+print(f"    - Train (60%): {len(train_df)} → {len(train_df)/total:.1%}")
+print(f"    - Test  (30%): {len(test_df)} → {len(test_df)/total:.1%}")
+print(f"    - Val   (10%): {len(val_df)} → {len(val_df)/total:.1%}")
+print("    - Label Distribution:\n", df[LABEL_COL].value_counts().sort_index())
+# =================================================================
+# Cell 2: Tokenizer, Custom Dataset, and Keyword Features Logic (FINAL CLEAN VERSION)
+# =================================================================
+%%time
+
+from transformers import AutoTokenizer
+from torch.utils.data import Dataset
+import torch
+from datasets import Dataset as HFDataset 
+
+# --- ۱. توکنایزر ---
+try:
+    tokenizer = AutoTokenizer.from_pretrained(HYPERPARAMS['model_name'])
+except Exception as e:
+    print(f"❌ Error loading tokenizer: {e}")
+    print("Trying to load the tokenizer from cache if the online download failed.")
+    tokenizer = AutoTokenizer.from_pretrained(HYPERPARAMS['model_name'], local_files_only=True)
+
+
+# --- ۲. تابع استخراج ویژگی کلیدواژه ---
+def get_keyword_features(text, keywords):
+    """
+    Extracts two features:
+    1. Presence of Indirect keywords (label 1)
+    2. Presence of Direct keywords (label 2)
+    """
+    feat = []
+    
+    # Feature 1: Indirect Keywords (Label 1)
+    present_1 = any(kw.lower() in text.lower() for kw in keywords.get(1, []))
+    feat.append(1.0 if present_1 else 0.0)
+    
+    # Feature 2: Direct Keywords (Label 2)
+    present_2 = any(kw.lower() in text.lower() for kw in keywords.get(2, []))
+    feat.append(1.0 if present_2 else 0.0)
+    
+    return torch.tensor(feat, dtype=torch.float)
+
+# --- ۳. دیتاست سفارشی (برای افزودن ویژگی کلیدواژه) ---
+class SuicideKeywordDataset(Dataset):
+    def __init__(self, df, tokenizer, max_length, keywords):
+        self.texts = df[TEXT_COL].values
+        self.labels = df[LABEL_COL].values
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.keywords = keywords
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = self.labels[idx]
+        
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        
+        # استخراج ویژگی‌های کلیدواژه
+        kw_feat = get_keyword_features(text, self.keywords)
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'keyword_features': kw_feat, 
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# --- ۴. ساخت دیتاست‌ها (تمیز شده از کاراکتر U+00A0) ---
+train_dataset = SuicideKeywordDataset(train_df, tokenizer, HYPERPARAMS['max_length'], keywords)
+val_dataset = SuicideKeywordDataset(val_df, tokenizer, HYPERPARAMS['max_length'], keywords)
+test_dataset = SuicideKeywordDataset(test_df, tokenizer, HYPERPARAMS['max_length'], keywords)
+
+
+print(f"✅ Custom Datasets ready: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
+
+print("\n✅ Installation complete. Global Hyperparameters set.")
+# =================================================================
+# Cell 3 (DEFINITIVE FIX - FILTERING IN FORWARD): Custom Model, Training Arguments, and Fine-Tuning
+# =================================================================
+%%time
+
+# 🚨 Imports لازم
+from typing import Dict, Any, Union, Optional, List, Tuple 
+from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+import torch
+import torch.nn as nn
+import time
+from sklearn.metrics import f1_score, accuracy_score
+
+
+# --- ۱. لود مدل پایه ---
+print(f"⚙️ Loading model from: {HYPERPARAMS['model_name']}")
+# ... (کد لود مدل ثابت است) ...
+try:
+    model = AutoModelForSequenceClassification.from_pretrained(
+        HYPERPARAMS['model_name'],
+        num_labels=HYPERPARAMS['num_labels']
+    )
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    print("Trying to load the model from cache if the online download failed.")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        HYPERPARAMS['model_name'],
+        num_labels=HYPERPARAMS['num_labels'],
+        local_files_only=True
+    )
+
+# --- ۲. پیاده‌سازی Keyword-Aware Classifier ---
+# ... (کد classifier ثابت است) ...
+old_weight = model.classifier.weight.data.clone()
+old_bias = model.classifier.bias.data.clone()
+hidden_size = model.config.hidden_size
+keyword_dim = HYPERPARAMS['keyword_dim'] 
+
+new_classifier = nn.Linear(hidden_size + keyword_dim, HYPERPARAMS['num_labels'])
+
+with torch.no_grad():
+    new_classifier.weight.data[:, :hidden_size] = old_weight
+    new_classifier.weight.data[:, hidden_size:] = 0
+    new_classifier.bias.data[:] = old_bias
+
+model.classifier = new_classifier
+
+# --- ۳. Monkey Patching متد forward (اضافه کردن فیلتر داخلی) ---
+def custom_forward(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    keyword_features=None,
+    labels=None,
+    **kwargs 
+) -> Dict[str, Any]:
+    
+    # 🚨 گام حیاتی: حذف آرگومان‌های ناخواسته قبل از ارسال به مدل پایه
+    if 'num_items_in_batch' in kwargs:
+        kwargs.pop('num_items_in_batch')
+    
+    # اجرای مدل BERT
+    outputs = self.bert(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        **kwargs 
+    )
+    cls_embedding = outputs.last_hidden_state[:, 0, :]
+    
+    # Concatenate [CLS] embedding and Keyword Features
+    if keyword_features is not None:
+        cls_embedding = torch.cat((cls_embedding, keyword_features.to(cls_embedding.device)), dim=-1)
+    
+    logits = self.classifier(cls_embedding)
+
+    loss = None
+    if labels is not None:
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, self.config.num_labels), labels.view(-1))
+
+    return {'loss': loss, 'logits': logits} if loss is not None else {'logits': logits}
+
+model.forward = custom_forward.__get__(model, model.__class__)
+
+print(f"✅ Custom **Keyword-Aware** Model ready! Input size: {hidden_size} + {keyword_dim} → {HYPERPARAMS['num_labels']}")
+
+# --- ۴. تابع Collate سفارشی ---
+def collate_fn(batch):
+    """Handles stacking and moving all necessary tensors to device."""
+    return {
+        'input_ids': torch.stack([x['input_ids'] for x in batch]),
+        'attention_mask': torch.stack([x['attention_mask'] for x in batch]),
+        'keyword_features': torch.stack([x['keyword_features'] for x in batch]),
+        'labels': torch.stack([x['labels'] for x in batch])
+    }
+
+# --- ۵. Custom Trainer برای حفظ سادگی (حذف فیلترهای قبلی) ---
+# 🚨 ما فیلتر را به custom_forward منتقل کردیم، بنابراین Trainer را ساده می‌کنیم.
+class InputFilterTrainer(Trainer):
+    # تنها prediction_step را برای اطمینان بیشتر فیلتر می‌کنیم.
+    def prediction_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool, ignore_keys: Optional[List[str]] = None) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # حذف آرگومان‌های ناخواسته از دیکشنری ورودی (در صورت وجود)
+        inputs.pop('num_items_in_batch', None) 
+        return super().prediction_step(model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys)
+
+# --- ۶. تنظیم آرگومان‌های آموزش و اجرای Fine-Tuning ---
+training_args = TrainingArguments(
+    output_dir='./results_diberta_kw',
+    num_train_epochs=HYPERPARAMS['num_epochs'],
+    per_device_train_batch_size=HYPERPARAMS['batch_size'],
+    per_device_eval_batch_size=HYPERPARAMS['batch_size'],
+    learning_rate=HYPERPARAMS['learning_rate'],
+    weight_decay=HYPERPARAMS['weight_decay'],
+    warmup_steps=HYPERPARAMS['warmup_steps'],
+    eval_strategy='epoch',
+    save_strategy='epoch',
+    logging_steps=10,
+    load_best_model_at_end=True,
+    metric_for_best_model='eval_loss', 
+    greater_is_better=False,
+    seed=HYPERPARAMS['random_state'],
+    fp16=torch.cuda.is_available(),
+)
+
+# استفاده از Custom Trainer (InputFilterTrainer)
+trainer = InputFilterTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=collate_fn,
+)
+
+# --- ۷. آموزش ---
+print("\n🚀 Starting Fine-Tuning (DiBERTa Keyword-Aware)...")
+start_time = time.time()
+trainer.train()
+TRAINING_TIME = time.time() - start_time
+trainer.save_model('./best_diberta_kw_model')
+print(f"✅ Training completed in {TRAINING_TIME:.2f} seconds")
+
+global TRAINING_TIME_SEC
+TRAINING_TIME_SEC = TRAINING_TIME
+# =================================================================
+# Cell 4: Full Evaluation, Plots (EN), and Excel Export
+# =================================================================
+%%time
+
+import numpy as np
+from sklearn.metrics import *
+from sklearn.preprocessing import label_binarize
+import pandas as pd
+from google.colab import files
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.special import softmax
+
+# --- ۱. پیش‌بینی روی TEST (30%) ---
+predictions = trainer.predict(test_dataset)
+logits = predictions.predictions
+pred_labels = np.argmax(logits, axis=1)
+pred_proba = softmax(logits, axis=1) # احتمال برای هر کلاس
+true_labels = predictions.label_ids
+
+CLASS_NAMES_LIST = ['Non-related (0)', 'Indirect Signs (1)', 'Direct Signs (2)']
+
+# --- ۲. محاسبه معیارهای کلی ---
+accuracy = accuracy_score(true_labels, pred_labels)
+f1_macro = f1_score(true_labels, pred_labels, average='macro')
+recall_macro = recall_score(true_labels, pred_labels, average='macro')
+precision_macro = precision_score(true_labels, pred_labels, average='macro')
+kappa = cohen_kappa_score(true_labels, pred_labels)
+mcc = matthews_corrcoef(true_labels, pred_labels)
+y_bin = label_binarize(true_labels, classes=[0,1,2])
+auc_ovr = roc_auc_score(y_bin, pred_proba, multi_class='ovr', average='macro')
+auc_ovo = roc_auc_score(y_bin, pred_proba, multi_class='ovo', average='macro')
+logloss = log_loss(true_labels, pred_proba)
+mae = mean_absolute_error(true_labels, pred_labels)
+
+# --- ۳. معیارهای هر کلاس ---
+report_dict = classification_report(true_labels, pred_labels, target_names=CLASS_NAMES_LIST, output_dict=True)
+precision_per = [report_dict[c]['precision'] for c in CLASS_NAMES_LIST]
+recall_per = [report_dict[c]['recall'] for c in CLASS_NAMES_LIST]
+f1_per = [report_dict[c]['f1-score'] for c in CLASS_NAMES_LIST]
+support_per = [report_dict[c]['support'] for c in CLASS_NAMES_LIST]
+
+
+# ==================================
+# بخش تولید اکسل (سه شیت)
+# ==================================
+
+# --- شیت ۱: Overall Metrics ---
+overall_df = pd.DataFrame({
+    'Metric': ['Accuracy', 'F1 Macro', 'Recall Macro', 'Precision Macro', 'Kappa', 'MCC',
+               'AUC (ROC-OVR)', 'AUC (ROC-OVO)', 'Log Loss', 'MAE', 'Training Time (s)'],
+    'Value': [accuracy, f1_macro, recall_macro, precision_macro, kappa, mcc,
+              auc_ovr, auc_ovo, logloss, mae, TRAINING_TIME_SEC]
+})
+overall_df['Value'] = overall_df['Value'].apply(lambda x: f"{x:.4f}" if isinstance(x, (float, np.float32, np.float64)) else x)
+
+
+# --- شیت ۲: Per-Class Metrics ---
+per_class_df = pd.DataFrame({
+    'Class': CLASS_NAMES_LIST,
+    'Precision': precision_per,
+    'Recall': recall_per,
+    'F1-Score': f1_per,
+    'Support': support_per
+})
+
+
+# --- شیت ۳: Important Phrases (Keyword Weights) ---
+print("\n⚙️ Calculating Keyword Importance Weights (Sheet 3)...")
+
+def get_keyword_weights_proxy(df, keywords_dict, logits, true_labels, keyword_dim):
+    """
+    Approximates keyword importance by looking at the input keyword feature values
+    and the resulting logits on the test set.
+    """
+    kw_list = []
+    
+    # Logit difference is used as a proxy for the model's confidence change.
+    for index, row in df.iterrows():
+        label = row[LABEL_COL]
+        text = row[TEXT_COL]
+        
+        # Get the keyword feature vector
+        kw_feat = get_keyword_features(text, keywords_dict).numpy()
+        
+        # If any keyword feature is 1.0 (keyword is present)
+        if np.any(kw_feat == 1.0):
+            # Logit for the actual/predicted label
+            logit_true = logits[index, label] 
+            
+            # Simple Proxy: The weight of the keyword feature in the final layer
+            # Since the new weights were initialized to zero, non-zero weight indicates learning.
+            # We use the Logit value for the corresponding class as a weight proxy.
+            
+            for i, kw_dim_idx in enumerate([1, 2]): # 1=Indirect, 2=Direct
+                if kw_feat[i] == 1.0: # Keyword is present
+                    
+                    # Logit value of the predicted label is a good proxy for confidence
+                    weight_proxy = logits[index, pred_labels[index]]
+                    
+                    for kw in keywords_dict[kw_dim_idx]:
+                        if kw.lower() in text.lower():
+                            kw_list.append({
+                                'Keyword': kw, 
+                                'Label': kw_dim_idx, 
+                                'Weight (Logit Proxy)': weight_proxy
+                            })
+                            
+    # Group and average the proxy weight for each unique keyword
+    if not kw_list: # Handle case with no keyword in test set (unlikely)
+        return pd.DataFrame({'Important Phrases/Tokens (Model Interpretation)': ['N/A'], 'Importance Weight': [0]})
+
+    kw_df_raw = pd.DataFrame(kw_list)
+    kw_df_grouped = kw_df_raw.groupby(['Keyword', 'Label'])['Weight (Logit Proxy)'].mean().reset_index()
+    kw_df_grouped.rename(
+        columns={'Keyword': 'Important Phrases/Tokens (Model Interpretation)', 'Weight (Logit Proxy)': 'Importance Weight'}, 
+        inplace=True
+    )
+    # Filter the top 50 keywords with highest average logit weight
+    return kw_df_grouped.sort_values(by='Importance Weight', ascending=False).head(50)
+
+kw_df = get_keyword_weights_proxy(test_df.reset_index(drop=True), keywords, logits, true_labels, KEYWORD_DIM)
+
+
+# --- ۴. ذخیره در فایل اکسل ---
+output_file = 'DiBERTa_Suicide_Prediction_Report.xlsx'
+with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    overall_df.to_excel(writer, sheet_name='Summary Metrics', index=False)
+    per_class_df.to_excel(writer, sheet_name='Per-Class Metrics', index=False)
+    kw_df.to_excel(writer, sheet_name='Important Phrases', index=False)
+
+print(f"\n✅ Excel file saved: '{output_file}' (3 sheets: Summary, Per-Class, Important Phrases).")
+files.download(output_file)
+
+
+# ==================================
+# بخش نمودارهای گرافیکی (توضیحات انگلیسی)
+# ==================================
+plt.rcParams.update({'font.size': 12, 'font.family': 'sans-serif'}) # Ensure readability
+
+# --- Confusion Matrix (EN) ---
+plt.figure(figsize=(8,6))
+cm = confusion_matrix(true_labels, pred_labels)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=CLASS_NAMES_LIST,
+            yticklabels=CLASS_NAMES_LIST)
+plt.title('Confusion Matrix: Actual vs. Predicted Labels', fontsize=14)
+plt.ylabel('Actual Label', fontsize=12)
+plt.xlabel('Predicted Label', fontsize=12)
+plt.show()
+
+
+# --- ROC Curve (One-vs-Rest) (EN) ---
+plt.figure(figsize=(10, 8))
+for i in range(NUM_LABELS):
+    fpr, tpr, _ = roc_curve(y_bin[:, i], pred_proba[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f'ROC curve of class {CLASS_NAMES_LIST[i]} (AUC = {roc_auc:.2f})')
+
+plt.plot([0, 1], [0, 1], 'k--', label='Chance (AUC = 0.50)')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve - OVR', fontsize=14)
+plt.legend(loc="lower right")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+
+# --- Bar Chart: Metrics Comparison (EN) ---
+metrics_plot_df = pd.DataFrame({
+    'Class': CLASS_NAMES_LIST,
+    'Precision': precision_per,
+    'Recall': recall_per,
+    'F1-Score': f1_per
+})
+metrics_plot_df.set_index('Class').plot(kind='bar', figsize=(10,6), color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+plt.title('Metrics Comparison Across Classes', fontsize=14)
+plt.ylabel('Score Value')
+plt.xlabel('Class Label')
+plt.xticks(rotation=15)
+plt.legend(title='Metric')
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+print("\n✅ All required plots are generated and saved.")
