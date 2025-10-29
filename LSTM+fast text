@@ -1,0 +1,135 @@
+# =================================================================
+# سلول ۲: مدلسازی LSTM با FastText (Embedding ثابت)
+# =================================================================
+%%time
+
+MODEL_NAME = "LSTM_FastText_FixedEmb" 
+
+# 🚨 تعریف مجدد متغیرهای گلوبال (برای اطمینان از دسترسی) 🚨
+try:
+    if 'y_labels' in globals():
+        LABELS = np.unique(y_labels).tolist() 
+        NUM_LABELS = len(LABELS)
+    else:
+        raise NameError("متغیرهای گلوبال (مانند y_labels) در دسترس نیستند. لطفا سلول ۱ را اجرا کنید.")
+    
+    CLASS_NAMES = {
+        0: 'Non-related', 
+        1: 'Indirect Suicide Signs', 
+        2: 'Direct Suicide Signs'
+    }
+except NameError as e:
+    print(f"❌ خطای حیاتی: {e}")
+    raise 
+
+# --- ۱. آماده‌سازی داده و آموزش FastText ---
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from gensim.models.fasttext import FastText as FastTextModel 
+import numpy as np
+import time
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+MAX_SEQUENCE_LENGTH = 100 
+MAX_WORDS = 10000 
+EMBEDDING_DIM = 200 # استفاده از ابعاد بالاتر برای FastText
+
+# توکن‌سازی (مناسب برای Keras)
+tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<unk>")
+tokenizer.fit_on_texts(X_train)
+
+# تبدیل متن به دنباله اعداد و Padding
+sequences_train = tokenizer.texts_to_sequences(X_train)
+sequences_test = tokenizer.texts_to_sequences(X_test)
+
+X_train_seq = pad_sequences(sequences_train, maxlen=MAX_SEQUENCE_LENGTH)
+X_test_seq = pad_sequences(sequences_test, maxlen=MAX_SEQUENCE_LENGTH)
+
+# تبدیل لیبل‌ها به فرمت One-Hot
+y_train_one_hot = to_categorical(y_train, num_classes=NUM_LABELS)
+y_test_one_hot = to_categorical(y_test, num_classes=NUM_LABELS)
+
+# --- ۲. ساخت ماتریس Embedding از FastText ---
+
+print("🚀 شروع آموزش FastText روی داده‌های شما (برای مقداردهی اولیه LSTM)...")
+
+tokenized_sentences = [text.split() for text in X_train]
+
+# آموزش مدل FastText
+fasttext_model = FastTextModel(
+    sentences=tokenized_sentences,
+    vector_size=EMBEDDING_DIM,
+    min_count=1,
+    window=5,
+    workers=4,
+    min_n=3, max_n=6, # تنظیمات خاص FastText
+    seed=42
+)
+fasttext_model.train(tokenized_sentences, total_examples=len(tokenized_sentences), epochs=10)
+print("✅ آموزش FastText به پایان رسید.")
+
+# ساخت ماتریس Embedding برای لایه Keras
+VOCAB_SIZE = len(tokenizer.word_index) + 1 
+embedding_matrix = np.zeros((VOCAB_SIZE, EMBEDDING_DIM))
+
+for word, i in tokenizer.word_index.items():
+    if i < VOCAB_SIZE:
+        if word in fasttext_model.wv:
+            embedding_matrix[i] = fasttext_model.wv[word]
+
+# --- ۳. ساخت مدل LSTM با لایه Embedding از پیش تعیین شده ---
+
+model = Sequential()
+
+# لایه Embedding: مقداردهی شده با بردارهای FastText
+model.add(Embedding(input_dim=VOCAB_SIZE, 
+                    output_dim=EMBEDDING_DIM, 
+                    weights=[embedding_matrix], # 🚨 استفاده از ماتریس FastText
+                    input_length=MAX_SEQUENCE_LENGTH, 
+                    trainable=False)) # 🚨 بردارها ثابت می‌مانند (Fixed)
+
+# 🚨 لایه LSTM
+model.add(LSTM(units=128, dropout=0.2, recurrent_dropout=0.2))
+
+# لایه‌های چگال
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.5))
+model.add(Dense(NUM_LABELS, activation='softmax'))
+
+model.compile(optimizer='adam', 
+              loss='categorical_crossentropy', 
+              metrics=['accuracy'])
+
+print("🚀 خلاصه مدل LSTM:")
+model.summary()
+
+# --- ۴. آموزش مدل ---
+grid_search_start = time.time() 
+
+callbacks = [EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)]
+
+history = model.fit(
+    X_train_seq, y_train_one_hot,
+    epochs=15, 
+    batch_size=32, 
+    validation_split=0.1, 
+    callbacks=callbacks,
+    verbose=1
+)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+
+# --- ۵. ارزیابی نهایی روی داده‌های Test ---
+print("\n📊 ارزیابی نهایی روی داده‌های تست...")
+y_prob_one_hot = model.predict(X_test_seq)
+y_prob = y_prob_one_hot 
+y_pred = np.argmax(y_prob_one_hot, axis=1)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
