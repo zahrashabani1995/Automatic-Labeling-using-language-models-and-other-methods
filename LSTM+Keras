@@ -1,0 +1,109 @@
+# =================================================================
+# سلول ۲: مدلسازی LSTM با Keras (Embedding قابل آموزش)
+# =================================================================
+%%time
+
+MODEL_NAME = "LSTM_Keras_TrainableEmb" 
+
+# 🚨 تعریف مجدد متغیرهای گلوبال (برای اطمینان از دسترسی) 🚨
+try:
+    if 'y_labels' in globals():
+        LABELS = np.unique(y_labels).tolist() 
+        NUM_LABELS = len(LABELS)
+    else:
+        raise NameError("متغیرهای گلوبال (مانند y_labels) در دسترس نیستند. لطفا سلول ۱ را اجرا کنید.")
+    
+    CLASS_NAMES = {
+        0: 'Non-related', 
+        1: 'Indirect Suicide Signs', 
+        2: 'Direct Suicide Signs'
+    }
+except NameError as e:
+    print(f"❌ خطای حیاتی: {e}")
+    raise 
+
+# --- ۱. آماده‌سازی داده برای Keras ---
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+import time
+import numpy as np
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+# تنظیمات ابعاد و طول دنباله
+MAX_SEQUENCE_LENGTH = 100 
+MAX_WORDS = 10000 
+EMBEDDING_DIM = 128 # افزایش ابعاد Embedding برای مدل LSTM
+
+# توکن‌سازی (مناسب برای Keras)
+tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<unk>")
+tokenizer.fit_on_texts(X_train)
+
+# تبدیل متن به دنباله اعداد و Padding
+sequences_train = tokenizer.texts_to_sequences(X_train)
+sequences_test = tokenizer.texts_to_sequences(X_test)
+
+X_train_seq = pad_sequences(sequences_train, maxlen=MAX_SEQUENCE_LENGTH)
+X_test_seq = pad_sequences(sequences_test, maxlen=MAX_SEQUENCE_LENGTH)
+
+# تبدیل لیبل‌ها به فرمت One-Hot
+y_train_one_hot = to_categorical(y_train, num_classes=NUM_LABELS)
+y_test_one_hot = to_categorical(y_test, num_classes=NUM_LABELS)
+
+# --- ۲. ساخت مدل LSTM ---
+
+VOCAB_SIZE = len(tokenizer.word_index) + 1 
+
+model = Sequential()
+
+# لایه Embedding قابل آموزش
+model.add(Embedding(input_dim=VOCAB_SIZE, 
+                    output_dim=EMBEDDING_DIM, 
+                    input_length=MAX_SEQUENCE_LENGTH, 
+                    trainable=True)) 
+
+# 🚨 لایه LSTM
+model.add(LSTM(units=128, dropout=0.2, recurrent_dropout=0.2)) # واحدهای LSTM
+
+# لایه‌های چگال (Dense) برای دسته‌بندی
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.5))
+model.add(Dense(NUM_LABELS, activation='softmax'))
+
+model.compile(optimizer='adam', 
+              loss='categorical_crossentropy', 
+              metrics=['accuracy'])
+
+print("🚀 خلاصه مدل LSTM:")
+model.summary()
+
+# --- ۳. آموزش مدل ---
+grid_search_start = time.time() 
+
+# تنظیم Callbacks
+callbacks = [EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)]
+
+history = model.fit(
+    X_train_seq, y_train_one_hot,
+    epochs=15, 
+    batch_size=32, 
+    validation_split=0.1, 
+    callbacks=callbacks,
+    verbose=1
+)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+
+# --- ۴. ارزیابی نهایی روی داده‌های Test ---
+print("\n📊 ارزیابی نهایی روی داده‌های تست...")
+y_prob_one_hot = model.predict(X_test_seq)
+y_prob = y_prob_one_hot 
+y_pred = np.argmax(y_prob_one_hot, axis=1)
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
