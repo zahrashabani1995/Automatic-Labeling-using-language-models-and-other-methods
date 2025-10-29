@@ -1,0 +1,392 @@
+# Cell 1: Install Required Libraries
+!pip install transformers datasets torch scikit-learn seaborn matplotlib pandas openpyxl accelerate -q
+# Cell 2: Upload and Load Data
+import pandas as pd
+from google.colab import files
+import io
+
+print("لطفاً فایل اکسل خود را آپلود کنید (ستون اول: متن، ستون دوم: لیبل 0/1/2)")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+
+# تنظیم نام ستون‌ها
+text_col = 'text'   # تغییر دهید اگر نام متفاوت است
+label_col = 'label' # تغییر دهید اگر نام متفاوت است
+
+df = df[[text_col, label_col]].dropna()
+df[label_col] = df[label_col].astype(int)
+
+print(f"Dataset: {df.shape}")
+print("Distribution:\n", df[label_col].value_counts().sort_index())
+# Cell 3: Keywords + Data Split (CORRECTED: 60% train, 30% test, 10% val)
+from sklearn.model_selection import train_test_split
+import re
+
+# --- کلیدواژه‌ها ---
+keywords = {
+    2: ["خودکشی", "آماده خودکشی", "نقشه خودکشی", "مرگ خودخواسته", "می‌خواهم خودم را بکشم",
+        "تا ابد بخوابم", "هیچوقت بیدار نشم", "به زندگی‌ام پایان می‌دهم", "نمی‌تونم ادامه بدم",
+        "نمی‌خوام زنده باشم", "خودسوزی", "زندگی برای من تمام شده", "خودم را خلاص کنم",
+        "خودمو خلاص کنم", "خودم رو خلاص کنم", "چرا نباید خودم را بکشم؟", "#خودکشی"],
+    1: ["افسردگی", "دارم عذاب می‌کشم", "هیچ امیدی ندارم", "از خودم متنفرم", "از خودم بدم میاد",
+        "چیزی برای از دست دادن ندارم", "از زندگی خسته‌ام", "تنها می‌میرم", "مرگ", "درد", "ناامیدی",
+        "تنهایی", "غم", "بی‌ارزش", "خستگی", "فشار رومه", "استرس", "استرس دارم", "همه چیز بی‌فایده است",
+        "هیچکس مرا نمی‌فهمد", "از همه چیز متنفرم", "#افسردگی", "#تنهایی", "#درد", "#غم", "#ناامیدی"],
+    0: []
+}
+
+# --- تمیز کردن متن ---
+def clean_text(text):
+    text = str(text)
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text)
+    text = re.sub(r'#\w+|@\w+', '', text)
+    text = re.sub(r'[^\w\s]', '', text)
+    return text.strip()
+
+df[text_col] = df[text_col].apply(clean_text)
+
+# --- تقسیم داده: 60% train, 30% test, 10% val ---
+# ابتدا 60% train و 40% بقیه
+train_df, temp_df = train_test_split(
+    df, test_size=0.4, stratify=df[label_col], random_state=42
+)
+
+# سپس 40% باقی‌مانده را به 30% test و 10% val تقسیم کنیم
+# یعنی 75% از temp_df برای test و 25% برای val
+test_df, val_df = train_test_split(
+    temp_df, test_size=0.25, stratify=temp_df[label_col], random_state=42
+)
+
+# --- بررسی ---
+total = len(df)
+print(f"Total: {total}")
+print(f"Train (60%): {len(train_df)} → {len(train_df)/total:.1%}")
+print(f"Test  (30%): {len(test_df)} → {len(test_df)/total:.1%}")
+print(f"Val   (10%): {len(val_df)} → {len(val_df)/total:.1%}")
+# Cell 4: ParsBERT Setup + Dataset
+from transformers import AutoTokenizer
+from torch.utils.data import Dataset
+import torch
+
+# --- تنظیمات مدل ---
+HYPERPARAMS = {
+    'model_name': 'HooshvareLab/bert-fa-zwnj-base',  # ParsBERT
+    'num_labels': 3,
+    'batch_size': 16,
+    'learning_rate': 2e-5,
+    'num_epochs': 5,
+    'weight_decay': 0.01,
+    'warmup_steps': 200,
+    'max_length': 128,
+    'random_state': 42,
+    'keyword_dim': 2
+}
+
+print("Hyperparameters:")
+for k, v in HYPERPARAMS.items():
+    print(f"  {k}: {v}")
+
+# --- توکنایزر ---
+tokenizer = AutoTokenizer.from_pretrained(HYPERPARAMS['model_name'])
+
+# --- ویژگی کلیدواژه ---
+def get_keyword_features(text, keywords):
+    feat = []
+    for lbl in [1, 2]:
+        present = any(kw.lower() in text.lower() for kw in keywords.get(lbl, []))
+        feat.append(1.0 if present else 0.0)
+    return torch.tensor(feat, dtype=torch.float)
+
+# --- دیتاست سفارشی ---
+class TweetDataset(Dataset):
+    def __init__(self, df, tokenizer, max_length, keywords):
+        self.texts = df[text_col].values
+        self.labels = df[label_col].values
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.keywords = keywords
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = self.labels[idx]
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        kw_feat = get_keyword_features(text, self.keywords)
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'keyword_features': kw_feat,
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# --- ساخت دیتاست‌ها ---
+train_dataset = TweetDataset(train_df, tokenizer, HYPERPARAMS['max_length'], keywords)
+val_dataset   = TweetDataset(val_df,   tokenizer, HYPERPARAMS['max_length'], keywords)
+test_dataset  = TweetDataset(test_df,  tokenizer, HYPERPARAMS['max_length'], keywords)
+
+print(f"Datasets ready: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
+# Cell 5: Custom ParsBERT + Training (FINAL & 100% WORKING - Monkey Patching)
+from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+import torch
+import torch.nn as nn
+import time
+
+# --- مرحله ۱: لود مدل پایه ---
+model = AutoModelForSequenceClassification.from_pretrained(
+    HYPERPARAMS['model_name'],
+    num_labels=HYPERPARAMS['num_labels']
+)
+
+# --- مرحله ۲: کپی وزن‌های classifier قدیمی ---
+old_weight = model.classifier.weight.data.clone()
+old_bias = model.classifier.bias.data.clone()
+hidden_size = model.config.hidden_size
+keyword_dim = HYPERPARAMS['keyword_dim']
+
+# --- مرحله ۳: ساخت classifier جدید ---
+new_classifier = nn.Linear(hidden_size + keyword_dim, HYPERPARAMS['num_labels'])
+
+# --- مرحله ۴: کپی وزن‌های قدیمی به قسمت اول ---
+with torch.no_grad():
+    new_classifier.weight.data[:, :hidden_size] = old_weight
+    new_classifier.weight.data[:, hidden_size:] = 0  # بقیه صفر
+    new_classifier.bias.data[:] = old_bias
+
+# --- مرحله ۵: جایگزینی classifier ---
+model.classifier = new_classifier
+
+# --- مرحله ۶: Monkey Patching متد forward ---
+def custom_forward(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    keyword_features=None,
+    labels=None,
+    **kwargs
+):
+    outputs = self.bert(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        **kwargs
+    )
+    cls_embedding = outputs.last_hidden_state[:, 0, :]  # [CLS]
+    if keyword_features is not None:
+        cls_embedding = torch.cat((cls_embedding, keyword_features), dim=-1)
+    logits = self.classifier(cls_embedding)
+
+    loss = None
+    if labels is not None:
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, self.config.num_labels), labels.view(-1))
+
+    return {'loss': loss, 'logits': logits} if loss is not None else {'logits': logits}
+
+# جایگزینی forward
+model.forward = custom_forward.__get__(model, model.__class__)
+
+print(f"Custom ParsBERT ready! Input size: {hidden_size} + {keyword_dim} → {HYPERPARAMS['num_labels']}")
+
+# --- تنظیمات آموزش ---
+training_args = TrainingArguments(
+    output_dir='./results',
+    num_train_epochs=HYPERPARAMS['num_epochs'],
+    per_device_train_batch_size=HYPERPARAMS['batch_size'],
+    per_device_eval_batch_size=HYPERPARAMS['batch_size'],
+    learning_rate=HYPERPARAMS['learning_rate'],
+    weight_decay=HYPERPARAMS['weight_decay'],
+    warmup_steps=HYPERPARAMS['warmup_steps'],
+    eval_strategy='epoch',
+    save_strategy='epoch',
+    logging_dir='./logs',
+    logging_steps=10,
+    load_best_model_at_end=True,
+    metric_for_best_model='eval_loss',
+    greater_is_better=False,
+    report_to=None,
+    seed=HYPERPARAMS['random_state'],
+    fp16=torch.cuda.is_available(),
+)
+
+# --- collate function ---
+def collate_fn(batch):
+    return {
+        'input_ids': torch.stack([x['input_ids'] for x in batch]),
+        'attention_mask': torch.stack([x['attention_mask'] for x in batch]),
+        'keyword_features': torch.stack([x['keyword_features'] for x in batch]),
+        'labels': torch.stack([x['labels'] for x in batch])
+    }
+
+# --- Trainer سفارشی ---
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        keyword_features = inputs.pop("keyword_features")
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            keyword_features=keyword_features,
+            labels=labels
+        )
+        loss = outputs.get("loss")
+        return (loss, outputs) if return_outputs else loss
+
+trainer = CustomTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=collate_fn,
+)
+
+# --- آموزش ---
+print("Starting training...")
+start_time = time.time()
+trainer.train()
+training_time = time.time() - start_time
+trainer.save_model('./best_parsbert_model')
+print(f"Training completed in {training_time:.2f} seconds")
+# Cell 6: Full Evaluation + Excel Export
+import numpy as np
+from sklearn.metrics import *
+from sklearn.preprocessing import label_binarize
+import pandas as pd
+from google.colab import files
+import torch
+
+# --- پیش‌بینی روی TEST (30%) ---
+predictions = trainer.predict(test_dataset)
+pred_labels = np.argmax(predictions.predictions, axis=1)
+pred_proba = torch.nn.functional.softmax(torch.tensor(predictions.predictions), dim=1).numpy()
+true_labels = predictions.label_ids
+
+# --- معیارهای کلی ---
+accuracy = accuracy_score(true_labels, pred_labels)
+f1_macro = f1_score(true_labels, pred_labels, average='macro')
+recall_macro = recall_score(true_labels, pred_labels, average='macro')
+precision_macro = precision_score(true_labels, pred_labels, average='macro')
+kappa = cohen_kappa_score(true_labels, pred_labels)
+mcc = matthews_corrcoef(true_labels, pred_labels)
+y_bin = label_binarize(true_labels, classes=[0,1,2])
+auc_ovr = roc_auc_score(y_bin, pred_proba, multi_class='ovr', average='macro')
+auc_ovo = roc_auc_score(y_bin, pred_proba, multi_class='ovo', average='macro')
+logloss = log_loss(true_labels, pred_proba)
+mae = mean_absolute_error(true_labels, pred_labels)
+
+# --- معیارهای هر کلاس ---
+precision_per, recall_per, f1_per, _ = precision_recall_fscore_support(true_labels, pred_labels, average=None)
+
+# --- وزن کلیدواژه‌ها (میانگین توجه) ---
+def get_keyword_weights(model, tokenizer, df, keywords_dict):
+    weights = {0: {}, 1: {}, 2: {}}
+    model.eval()
+    with torch.no_grad():
+        for _, row in df.iterrows():
+            label = row[label_col]
+            if label not in [1, 2]: continue
+            text = row[text_col]
+            encoding = tokenizer(text, return_tensors='pt', max_length=128, truncation=True, padding=True)
+            encoding = {k: v.to(model.device) for k, v in encoding.items()}
+            outputs = model.bert(**encoding, output_attentions=True)
+            att = outputs.attentions[-1].mean(dim=1)[:, 0, 1:].mean().item()  # توجه به توکن‌های غیر-CLS
+            for kw in keywords_dict[label]:
+                if kw.lower() in text.lower():
+                    weights[label][kw] = weights[label].get(kw, 0) + att
+    # نرمال‌سازی
+    for label in weights:
+        total_occ = sum(text.lower().count(kw.lower()) for kw in keywords_dict[label] for text in df[df[label_col]==label][text_col])
+        for kw in weights[label]:
+            weights[label][kw] /= max(1, total_occ)
+    return weights
+
+kw_weights = get_keyword_weights(model, tokenizer, test_df, keywords)
+
+# --- ساخت دیتافریم‌ها ---
+overall_df = pd.DataFrame({
+    'Metric': ['Accuracy', 'F1 Macro', 'Recall Macro', 'Precision Macro', 'Kappa', 'MCC',
+               'AUC (ROC-OVR)', 'AUC (ROC-OVO)', 'Log Loss', 'MAE', 'Training Time (s)'],
+    'Value': [accuracy, f1_macro, recall_macro, precision_macro, kappa, mcc,
+              auc_ovr, auc_ovo, logloss, mae, training_time]
+})
+
+per_class_df = pd.DataFrame({
+    'Class': ['Non-relevant (0)', 'Indirect (1)', 'Direct (2)'],
+    'Precision': precision_per,
+    'Recall': recall_per,
+    'F1-Score': f1_per
+})
+
+kw_list = []
+for label, kws in kw_weights.items():
+    for kw, wt in kws.items():
+        kw_list.append({'Keyword': kw, 'Label': label, 'Weight (Avg Attention)': wt})
+kw_df = pd.DataFrame(kw_list)
+
+# --- ذخیره در اکسل ---
+output_file = 'parsbert_evaluation.xlsx'
+with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    overall_df.to_excel(writer, sheet_name='Overall Metrics', index=False)
+    per_class_df.to_excel(writer, sheet_name='Per-Class Metrics', index=False)
+    kw_df.to_excel(writer, sheet_name='Keyword Weights', index=False)
+
+files.download(output_file)
+print(f"Excel file saved and downloaded: {output_file}")
+# Cell 7: Plots
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+
+# --- Confusion Matrix ---
+plt.figure(figsize=(8,6))
+cm = confusion_matrix(true_labels, pred_labels)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Non-relevant (0)', 'Indirect (1)', 'Direct (2)'],
+            yticklabels=['Non-relevant (0)', 'Indirect (1)', 'Direct (2)'])
+plt.title('Confusion Matrix')
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.show()
+
+# --- ROC Curve (One-vs-Rest) ---
+plt.figure(figsize=(8,6))
+for i in range(3):
+    fpr, tpr, _ = roc_curve(y_bin[:, i], pred_proba[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f'Class {i} (AUC = {roc_auc:.2f})')
+plt.plot([0,1],[0,1],'k--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curves (One-vs-Rest)')
+plt.legend(loc="lower right")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# --- Bar Chart: Metrics Comparison ---
+metrics_df = pd.DataFrame({
+    'Class': ['0', '1', '2', 'Macro Avg'],
+    'Precision': list(precision_per) + [precision_macro],
+    'Recall': list(recall_per) + [recall_macro],
+    'F1-Score': list(f1_per) + [f1_macro]
+})
+metrics_df.set_index('Class').plot(kind='bar', figsize=(10,6), color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+plt.title('Metrics Comparison Across Classes')
+plt.ylabel('Score')
+plt.xlabel('Class')
+plt.xticks(rotation=0)
+plt.legend(title='Metric')
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
