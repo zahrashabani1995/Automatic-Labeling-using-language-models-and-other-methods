@@ -1,0 +1,284 @@
+# =================================================================
+# سلول ۲: مدلسازی LSTM با Word2Vec (Embedding ثابت)
+# =================================================================
+%%time
+
+MODEL_NAME = "LSTM_Word2Vec_FixedEmb" 
+
+# 🚨 تعریف مجدد متغیرهای گلوبال (برای اطمینان از دسترسی) 🚨
+try:
+    if 'y_labels' in globals():
+        LABELS = np.unique(y_labels).tolist() 
+        NUM_LABELS = len(LABELS)
+    else:
+        raise NameError("متغیرهای گلوبال (مانند y_labels) در دسترس نیستند. لطفا سلول ۱ را اجرا کنید.")
+    
+    CLASS_NAMES = {
+        0: 'Non-related', 
+        1: 'Indirect Suicide Signs', 
+        2: 'Direct Suicide Signs'
+    }
+except NameError as e:
+    print(f"❌ خطای حیاتی: {e}")
+    raise 
+
+# --- ۱. آماده‌سازی داده و آموزش Word2Vec ---
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from gensim.models import Word2Vec 
+import numpy as np
+import time
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+MAX_SEQUENCE_LENGTH = 100 
+MAX_WORDS = 10000 
+EMBEDDING_DIM = 100 # ابعاد Word2Vec
+
+# توکن‌سازی (مناسب برای Keras)
+tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<unk>")
+tokenizer.fit_on_texts(X_train)
+
+# تبدیل متن به دنباله اعداد و Padding
+sequences_train = tokenizer.texts_to_sequences(X_train)
+sequences_test = tokenizer.texts_to_sequences(X_test)
+
+X_train_seq = pad_sequences(sequences_train, maxlen=MAX_SEQUENCE_LENGTH)
+X_test_seq = pad_sequences(sequences_test, maxlen=MAX_SEQUENCE_LENGTH)
+
+# تبدیل لیبل‌ها به فرمت One-Hot
+y_train_one_hot = to_categorical(y_train, num_classes=NUM_LABELS)
+y_test_one_hot = to_categorical(y_test, num_classes=NUM_LABELS)
+
+# --- ۲. ساخت ماتریس Embedding از Word2Vec ---
+
+print("🚀 شروع آموزش Word2Vec روی داده‌های شما (برای مقداردهی اولیه LSTM)...")
+
+tokenized_sentences = [text.split() for text in X_train]
+
+# آموزش مدل Word2Vec
+word2vec_model = Word2Vec(
+    sentences=tokenized_sentences,
+    vector_size=EMBEDDING_DIM,
+    min_count=1,
+    window=5,
+    workers=4,
+    seed=42
+)
+word2vec_model.train(tokenized_sentences, total_examples=len(tokenized_sentences), epochs=10)
+print("✅ آموزش Word2Vec به پایان رسید.")
+
+# ساخت ماتریس Embedding برای لایه Keras
+VOCAB_SIZE = len(tokenizer.word_index) + 1 
+embedding_matrix = np.zeros((VOCAB_SIZE, EMBEDDING_DIM))
+
+for word, i in tokenizer.word_index.items():
+    if i < VOCAB_SIZE:
+        if word in word2vec_model.wv:
+            embedding_matrix[i] = word2vec_model.wv[word]
+
+# --- ۳. ساخت مدل LSTM با لایه Embedding از پیش تعیین شده ---
+
+model = Sequential()
+
+# لایه Embedding: مقداردهی شده با بردارهای Word2Vec
+model.add(Embedding(input_dim=VOCAB_SIZE, 
+                    output_dim=EMBEDDING_DIM, 
+                    weights=[embedding_matrix], # 🚨 استفاده از ماتریس Word2Vec
+                    input_length=MAX_SEQUENCE_LENGTH, 
+                    trainable=False)) # 🚨 این مهم است: بردارها ثابت می‌مانند (Fixed)
+
+# 🚨 لایه LSTM
+model.add(LSTM(units=128, dropout=0.2, recurrent_dropout=0.2))
+
+# لایه‌های چگال
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.5))
+model.add(Dense(NUM_LABELS, activation='softmax'))
+
+model.compile(optimizer='adam', 
+              loss='categorical_crossentropy', 
+              metrics=['accuracy'])
+
+print("🚀 خلاصه مدل LSTM:")
+model.summary()
+
+# --- ۴. آموزش مدل ---
+grid_search_start = time.time() 
+
+callbacks = [EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)]
+
+history = model.fit(
+    X_train_seq, y_train_one_hot,
+    epochs=15, 
+    batch_size=32, 
+    validation_split=0.1, 
+    callbacks=callbacks,
+    verbose=1
+)
+
+grid_search_end = time.time()
+training_time = grid_search_end - grid_search_start
+
+print(f"\n✅ آموزش با موفقیت به پایان رسید. زمان آموزش: {training_time:.2f} ثانیه")
+
+# --- ۵. ارزیابی نهایی روی داده‌های Test ---
+print("\n📊 ارزیابی نهایی روی داده‌های تست...")
+y_prob_one_hot = model.predict(X_test_seq)
+y_prob = y_prob_one_hot 
+y_pred = np.argmax(y_prob_one_hot, axis=1)
+# =================================================================
+# سلول ۳: محاسبه و ذخیره گزارش‌های آماری جامع (نسخه استاندارد شده)
+# =================================================================
+%%time
+
+from sklearn.metrics import (
+    accuracy_score, f1_score, recall_score, precision_score, 
+    confusion_matrix, log_loss, cohen_kappa_score, matthews_corrcoef, 
+    roc_auc_score, mean_absolute_error, precision_recall_fscore_support
+)
+from sklearn.preprocessing import LabelBinarizer
+import pandas as pd
+import numpy as np
+from google.colab import files 
+import time
+
+# 🚨 متغیرهای MODEL_NAME و training_time از سلول ۲ استفاده می‌شوند.
+# 🚨 فرض می‌کنیم LABELS و CLASS_NAMES از سلول ۱/۲ در دسترس هستند.
+# 🚨 متغیرهای y_test، y_pred و y_prob از سلول ۲ در دسترس هستند.
+
+
+# --- الف: محاسبه معیارهای کلی (فایل اکسل ۱) ---
+accuracy = accuracy_score(y_test, y_pred)
+f1_macro = f1_score(y_test, y_pred, average='macro')
+recall_macro = recall_score(y_test, y_pred, average='macro')
+precision_macro = precision_score(y_test, y_pred, average='macro')
+kappa = cohen_kappa_score(y_test, y_pred)
+mcc = matthews_corrcoef(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+
+# محاسبه Log Loss و AUC (فقط در صورت وجود پروبالیتی)
+try:
+    logloss = log_loss(y_test, y_prob)
+except ValueError:
+    logloss = "N/A (Probabilities not available or incompatible)"
+
+lb = LabelBinarizer()
+y_test_binarized = lb.fit_transform(y_test)
+
+try:
+    if len(LABELS) > 2:
+        auc_roc_ovr = roc_auc_score(y_test_binarized, y_prob, multi_class='ovr')
+        auc_roc_ovo = roc_auc_score(y_test, y_prob, multi_class='ovo')
+    else:
+        auc_roc_ovr = roc_auc_score(y_test_binarized, y_prob[:, 1])
+        auc_roc_ovo = "N/A (Binary)"
+except Exception: 
+    auc_roc_ovr = "Error/N/A"
+    auc_roc_ovo = "Error/N/A"
+    
+# تعیین نوع Embedding بر اساس نام مدل برای گزارش‌دهی
+if 'TFIDF' in MODEL_NAME:
+    EMBEDDING_TYPE = 'TF-IDF'
+elif 'Word2Vec' in MODEL_NAME:
+    EMBEDDING_TYPE = 'Word2Vec'
+elif 'FastText' in MODEL_NAME:
+    EMBEDDING_TYPE = 'FastText'
+elif 'Keras' in MODEL_NAME:
+    EMBEDDING_TYPE = 'Keras Trainable/Fixed'
+else:
+    EMBEDDING_TYPE = 'N/A'
+
+
+results_overall = {
+    'Model': [MODEL_NAME], 'Embedding': [EMBEDDING_TYPE],
+    'Accuracy': [accuracy], 'F1-Macro': [f1_macro], 'Recall-Macro': [recall_macro],
+    'Precision-Macro': [precision_macro], 'Kappa': [kappa], 'MCC': [mcc],
+    'AUC-ROC (OVR)': [auc_roc_ovr], 'AUC-ROC (OVO)': [auc_roc_ovo],
+    'Log Loss': [logloss], 'MAE': [mae],
+    'Training Time (s)': [training_time] 
+}
+df_overall = pd.DataFrame(results_overall)
+
+
+# --- ب: محاسبه معیارهای تفکیک شده بر اساس کلاس (فایل اکسل ۲) ---
+precision_c, recall_c, f1_c, support_c = precision_recall_fscore_support(
+    y_test, y_pred, labels=LABELS, average=None
+)
+
+# محاسبه Specificity، NPV و AUC برای هر کلاس
+specificity_c = []
+npv_c = []
+auc_c = []
+
+for i, label in enumerate(LABELS):
+    cm_binary = confusion_matrix(y_test == label, y_pred == label, labels=[True, False])
+    
+    if cm_binary.size == 4:
+        tn, fp, fn, tp = cm_binary.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 
+    specificity_c.append(specificity)
+
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0 
+    npv_c.append(npv)
+    
+    try:
+        # AUC OVR برای هر کلاس
+        auc_class = roc_auc_score(y_test_binarized[:, i], y_prob[:, i])
+        auc_c.append(auc_class)
+    except Exception:
+        auc_c.append(np.nan)
+
+
+df_class_metrics = pd.DataFrame({
+    'Class': [CLASS_NAMES.get(i, f'Class {i}') for i in LABELS],
+    'Precision': precision_c,
+    'Recall (Sensitivity)': recall_c, 
+    'Specificity': specificity_c,
+    'F1-Score': f1_c,
+    'NPV (Negative Predictive Value)': npv_c,
+    'AUC (OVR)': auc_c,
+    'Support': support_c
+})
+
+# اضافه کردن میانگین‌ها به پایین جدول کلاس‌ها
+df_class_metrics.loc[len(df_class_metrics)] = {
+    'Class': 'Macro Average',
+    'Precision': precision_macro, 
+    'Recall (Sensitivity)': recall_macro, 
+    'F1-Score': f1_macro, 
+    'Specificity': np.mean(specificity_c), 
+    'NPV (Negative Predictive Value)': np.mean(npv_c),
+    'AUC (OVR)': auc_roc_ovr if isinstance(auc_roc_ovr, float) else np.nan,
+    'Support': np.sum(support_c)
+}
+
+
+# --- ج: استخراج واژگان کلیدی (فایل اکسل ۳ - Placeholder برای مدل‌های غیر TF-IDF) ---
+# برای مدل‌های Keras، این تحلیل اعمال نمی‌شود.
+key_words_df = pd.DataFrame({
+    'Feature': ['N/A (Key word analysis only for TF-IDF/CountVec models)'],
+    'Weight': ['N/A']
+}) 
+print("⚠️ اخطار: تحلیل واژگان کلیدی برای این نوع مدل (Keras) اعمال نمی‌شود.")
+
+
+# --- د: ذخیره‌سازی نهایی در فایل‌های اکسل ---
+output_file = f'{MODEL_NAME}_Evaluation_Reports.xlsx'
+
+with pd.ExcelWriter(output_file) as writer:
+    df_overall.to_excel(writer, sheet_name='1_Overall_Metrics', index=False)
+    df_class_metrics.to_excel(writer, sheet_name='2_Class_Metrics', index=False)
+    key_words_df.to_excel(writer, sheet_name='3_Key_Words_Analysis', index=False)
+
+files.download(output_file)
+print(f"\n✅ گزارش‌های آماری جامع با موفقیت در {output_file} ذخیره شدند.")
+print("زمان کل اجرای سلول ۳ (گزارش‌دهی آماری):")
+
+print("\nزمان کل اجرای سلول ۲ (مدلسازی):")
